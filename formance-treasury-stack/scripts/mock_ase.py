@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Mock account-servicing-entity endpoints Rafiki calls: /rates (FX) and /webhooks (events). Logs webhooks to webhooks.jsonl."""
-import json, sys, os
+import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 LOG = os.environ.get("WEBHOOK_LOG", "webhooks.jsonl")
 RATES = {"base": "USD", "rates": {"EUR": 0.92, "GBP": 0.79, "USD": 1.0}}

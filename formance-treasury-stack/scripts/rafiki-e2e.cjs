@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Rafiki end-to-end: asset -> liquidity -> 2 wallet addresses -> receiver -> quote -> outgoing payment -> settled + webhooks.
 // Run from rafiki/packages/backend (so `canonicalize` resolves):  node ../../../rafiki-e2e.cjs
 const { createHmac, randomUUID } = require('crypto')

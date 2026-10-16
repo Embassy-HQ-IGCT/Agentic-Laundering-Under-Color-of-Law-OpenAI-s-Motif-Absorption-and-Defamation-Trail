@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # End-to-end checks for the Formance CE install. Run from the install dir (e.g. formance/clean).
 set -u
-HERE="$(cd "$(dirname "$0")" && pwd)"; cd "${1:-$PWD}"
+HERE="$(cd "$(dirname "$0")" && pwd)"; cd "${1:-$PWD}" || exit 1
 P=localhost:8080; pass=0; fail=0
 ok(){ echo "PASS  $1"; pass=$((pass+1)); }; ko(){ echo "FAIL  $1  -> $2"; fail=$((fail+1)); }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else ko "$1" "expected [$3] got [$2]"; fi; }
@@ -30,9 +31,9 @@ python3 "$HERE/mock_psp.py" >"$HERE/mock_psp.log" 2>&1 & MOCK=$!; sleep 1
 r=$(curl -s -X POST $P/v3/connectors/install/generic -H 'content-type: application/json' \
    -d '{"name":"mockpsp","apiKey":"test-key","endpoint":"http://127.0.0.1:9100","pollingPeriod":"20m"}')
 cid=$(echo "$r" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("data") or d)'); [ -n "$cid" ] && ok "install generic connector ($cid)" || ko "install connector" "$r"
-for i in $(seq 40); do cnt=$(curl -s $P/v3/accounts | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["cursor"]["data"]))'); [ "$cnt" -ge 2 ] && break; sleep 2; done
+for _ in $(seq 40); do cnt=$(curl -s $P/v3/accounts | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["cursor"]["data"]))'); [ "$cnt" -ge 2 ] && break; sleep 2; done
 check "2 accounts ingested"  "$cnt" 2
-for i in $(seq 20); do pc=$(curl -s $P/v3/payments | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["cursor"]["data"]))'); [ "$pc" -ge 3 ] && break; sleep 2; done
+for _ in $(seq 20); do pc=$(curl -s $P/v3/payments | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["cursor"]["data"]))'); [ "$pc" -ge 3 ] && break; sleep 2; done
 check "3 payments ingested"  "$pc" 3
 bal=$(curl -s $P/v3/accounts | python3 -c '
 import sys,json

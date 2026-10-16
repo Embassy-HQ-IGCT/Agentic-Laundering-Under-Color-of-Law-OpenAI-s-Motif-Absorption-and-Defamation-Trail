@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Offline audit of the rendered platform manifests (no cluster needed). Fails if a production-hardening property is missing.
 Usage: validate-manifests.py platform.yaml"""
 import sys

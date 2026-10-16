@@ -1,6 +1,6 @@
 # Runbook: standing the stack up fast, and every blocker we hit
 
-Scope: **Formance Community Edition (MIT)** Ledger v3 + Payments, **Rafiki** (Interledger), the **treasury engine**, and the **GKE kit**. "Forminix" / "4minutes" in earlier notes = **Formance**.
+Scope: **Formance** Ledger v3 + Payments Community Edition, **Rafiki** (Interledger), the **treasury engine**, and the **GKE kit**. "Forminix" / "4minutes" in earlier notes = **Formance**.
 
 ## 1. How long it takes (measured, not estimated)
 
@@ -59,11 +59,11 @@ Rafiki is optional for the engine tests (webhooks are replayed from recorded eve
 
 ## 4. Licensing note
 
-Everything here runs on the MIT Community Edition (16 connectors). `ee/` code (6 more connectors) is under a separate license: development/testing is permitted without an agreement, **production requires a Formance Enterprise or Subscription Agreement**. This stack does not depend on it.
+See `THIRD_PARTY.md`. In short: this project is Apache-2.0. Formance **Payments** Community Edition is MIT (only if you have no registered account on Formance's cloud); its `ee/` code needs an agreement for production. Formance **Ledger v3 shipped without any licence terms** in the tested revision: resolve that before production use or redistribution. Prefer OpenTofu (MPL-2.0) over Terraform (BUSL-1.1).
 
 ## 5. Getting this code onto GitHub
 
-The session's pre-attached repository refused the push (blocker 20); creating a new repository is not permitted for the integration; and attaching `IGCT-Foreign-Authority/hyperswitch` with push access was accepted but reported `push_check: refused` (the Claude GitHub App has no write access there either). The fix is on the GitHub side: install/authorise the Claude GitHub App on the target repository. Simplest route from any machine with access:
+Pushing worked once the Claude GitHub App was authorised on the target repository (blocker 20). Creating a *new* repository is still not permitted for the integration, so create an empty public repo yourself and push there; and attaching `IGCT-Foreign-Authority/hyperswitch` with push access was accepted but reported `push_check: refused` (the Claude GitHub App has no write access there either). The fix is on the GitHub side: install/authorise the Claude GitHub App on the target repository. Simplest route from any machine with access:
 
 ```bash
 git bundle create formance-treasury-stack.bundle claude/full-deployment-all-connectors-exi0oz   # or copy the directory

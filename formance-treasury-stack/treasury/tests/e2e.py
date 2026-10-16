@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """End-to-end test of the treasury engine against a live engine + Ledger (server started with TREASURY_TEST_CLOCK=1 TREASURY_ADMIN=1).
 Usage: e2e.py [base_url] [rafiki_webhooks.jsonl]"""
 import concurrent.futures as cf
@@ -13,7 +14,7 @@ import client
 from client import call as _call
 
 client.configure(sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:8200")
-RAFIKI_LOG = sys.argv[2] if len(sys.argv) > 2 else ""
+RAFIKI_LOG = (sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "rafiki-webhooks.jsonl"))
 R = uuid.uuid4().hex[:6]            # run id: keeps ids unique across runs
 
 SAT_3AM = "2026-10-17T03:00:00-04:00"      # Saturday, deep outside business hours

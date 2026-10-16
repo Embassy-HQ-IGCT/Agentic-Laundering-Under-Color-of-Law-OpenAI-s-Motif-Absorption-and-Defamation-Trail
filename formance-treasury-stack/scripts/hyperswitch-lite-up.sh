@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Hyperswitch (Juspay) "Standalone / lite" profile, built from source: app server + Postgres + Redis only.
 # Mirrors scripts/setup.sh's standalone profile (pg, redis, migrations, superposition, hyperswitch-server) but:
 #   - builds the router binary locally (docker.juspay.io / ghcr.io images may be unreachable),

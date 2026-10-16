@@ -1,0 +1,8 @@
+formance-treasury-stack
+Copyright 2026 The formance-treasury-stack contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It interoperates with, but does not bundle or redistribute, the third-party software listed in THIRD_PARTY.md.
+Read that file before you run or redistribute the complete stack: one component (Formance Ledger v3) published no license terms in the
+revision this project was tested against.

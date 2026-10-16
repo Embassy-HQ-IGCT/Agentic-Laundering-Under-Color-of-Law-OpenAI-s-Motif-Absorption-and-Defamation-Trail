@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Signed HTTP client shared by the test suites. Signs every request exactly as a production client must."""
 import hashlib
 import hmac

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Resilience + security suite: crash recovery (fault injection), idempotency binding, auth, validation, rate limits, ops endpoints.
 Requires a server started with TREASURY_ENV=test and the API keys defined in run-local-tests.sh."""
 import concurrent.futures as cf
-import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 import uuid
@@ -15,7 +14,6 @@ import client
 from client import call, raw_call, sign
 
 client.configure(sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:8200")
-RAFIKI_LOG = sys.argv[2] if len(sys.argv) > 2 else ""
 R = uuid.uuid4().hex[:6]
 SAT = "2026-10-17T03:00:00-04:00"
 P = F = 0
@@ -159,18 +157,11 @@ seed("rsettle", [["world", "rafiki:settlement", 100, "USD/2"]])
 eq("correctly signed webhook accepted", call("POST", "/rafiki/webhooks", ev, rafiki=True)[0], 200)
 eq("redelivery is idempotent", call("POST", "/rafiki/webhooks", ev, rafiki=True)[1]["duplicate"], True)
 eq("credited exactly once", wal(f"rw{R}")["balance"], 100)
-if RAFIKI_LOG and os.path.exists(RAFIKI_LOG):
-    evs = [json.loads(l) for l in open(RAFIKI_LOG) if l.strip()][:6]
-    nodedir = os.path.join(os.path.dirname(RAFIKI_LOG), "..", "rafiki", "packages", "backend")
-    try:
-        js = ("const {canonicalize}=require('json-canonicalize');const e=JSON.parse(require('fs').readFileSync(0,'utf8'));"
-              "console.log(JSON.stringify(e.map(x=>canonicalize({id:x.id,type:x.type,data:x.data}))))")
-        out = subprocess.run(["node", "-e", js], input=json.dumps(evs), capture_output=True, text=True, cwd=nodedir, timeout=20)
-        theirs = json.loads(out.stdout)
-        ok("our JSON canonicalization matches Rafiki's json-canonicalize on real recorded events",
-           theirs == [client.canonical({"id": x["id"], "type": x["type"], "data": x["data"]}) for x in evs], out.stderr[:200])
-    except Exception as e:
-        print("SKIP  canonicalization cross-check (node/json-canonicalize unavailable):", str(e)[:80])
+FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+fx_events = [json.loads(l) for l in open(os.path.join(FIX, "rafiki-webhooks.jsonl")) if l.strip()]
+fx_canon = json.load(open(os.path.join(FIX, "rafiki-canonical.json")))["canonical"]
+ok("our JSON canonicalization equals Rafiki's own json-canonicalize on real recorded events",
+   fx_canon == [client.canonical({"id": x["id"], "type": x["type"], "data": x["data"]}) for x in fx_events])
 
 print("== validation and limits")
 V = lambda b: call("POST", "/transfers", b)[0]

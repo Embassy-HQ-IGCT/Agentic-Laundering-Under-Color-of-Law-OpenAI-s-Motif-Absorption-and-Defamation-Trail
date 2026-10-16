@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 variable "project_id" { type = string }
 variable "region" { type = string }
 variable "name" {

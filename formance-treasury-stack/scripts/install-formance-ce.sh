@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Formance Community Edition: Ledger v3 + Payments (16 CE connectors) + Temporal workflows.
 # Native Go binaries; Postgres and Temporal run in containers. Requires: git, go >= 1.27, docker.
 set -euo pipefail

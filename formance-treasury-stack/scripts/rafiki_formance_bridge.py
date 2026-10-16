@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Rafiki -> Formance Ledger bridge.
 
 Receives Rafiki (account-servicing-entity) webhooks and posts double-entry transactions to a Formance Ledger v3.

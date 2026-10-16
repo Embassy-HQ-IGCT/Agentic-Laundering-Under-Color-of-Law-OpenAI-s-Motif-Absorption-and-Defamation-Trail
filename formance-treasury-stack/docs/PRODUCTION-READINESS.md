@@ -20,7 +20,7 @@ section is the blocking checklist.
 | **Operations** | `/livez`, `/readyz` (Ledger + DB + not draining), Prometheus metrics on a separate internal port, JSON access logs with request id + actor, append-only audit table, actor/request id/fingerprint stamped into every Ledger transaction, graceful SIGTERM drain, background recovery loop (resume stuck payouts, resolve unknowns, expire holds). | Shutdown, metrics, audit and Ledger-metadata tests. |
 | **Privilege** | Runs as uid 10001 from a **read-only** source tree with no writable paths (state in Postgres). | Full suite passes in that mode. |
 | **Manifests** | Offline audit (`gke/validate-manifests.py`) fails if the engine loses: >=2 replicas, zero-downtime rollout, non-root, read-only rootfs, dropped capabilities, seccomp, probes, resource limits, secret-sourced credentials, PDB, NetworkPolicy, the Ledger bootstrap job. Negative-control tested. | Passes on the rendered output; rejects a weakened one. |
-| **Infra as code** | Terraform: private VPC + NAT, private GKE Autopilot (authorized networks), Cloud SQL Postgres 15 (private IP, HA, PITR backups, deletion protection), Memorystore, Artifact Registry, Secret Manager, Workload Identity. | `terraform validate` passes. |
+| **Infra as code** | Infrastructure as code (OpenTofu preferred, Terraform works; both validate): private VPC + NAT, private GKE Autopilot (authorized networks), Cloud SQL Postgres 15 (private IP, HA, PITR backups, deletion protection), Memorystore, Artifact Registry, Secret Manager, Workload Identity. | `tofu validate` and `terraform validate` pass. |
 
 ## 2. Known limitations of what is built
 
@@ -44,6 +44,7 @@ section is the blocking checklist.
 
 ## 4. Go-live checklist (blocking)
 
+- [ ] **Licensing:** obtain written licence terms for Formance Ledger v3 (none were published in the tested revision) or switch to a licensed ledger; see `THIRD_PARTY.md`.
 - [ ] Real bank adapters implemented and certified against each bank's sandbox; idempotency + `lookup` proven with the bank.
 - [ ] Bank-confirmed rail participation, limits and cutoffs loaded into config (`TREASURY_RAILS_JSON`, `TREASURY_HOLIDAYS`).
 - [ ] `gke-deploy.sh --plan` reviewed, then `--apply` in a staging project; full suite re-run against staging.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Treasury engine: the Ledger is the source of truth for every balance; SQLite holds only operational state
 (payout/auth records, card controls, quotes, facility terms) needed to drive workflows and answer queries.
 
@@ -27,7 +28,7 @@ import uuid
 
 import rails as railmod
 from banks import AdapterError, Rejected
-from ledger import IdempotencyConflict, InsufficientFunds, Ledger, LedgerError
+from ledger import IdempotencyConflict, InsufficientFunds, LedgerError
 from store import Store
 
 RESP = {"APPROVED": "00", "DO_NOT_HONOR": "05", "INSUFFICIENT_FUNDS": "51", "EXCEEDS_LIMIT": "61", "RESTRICTED": "62",
@@ -691,7 +692,7 @@ class Treasury:
             r = self.led.tx(f"fx:{qt['id']}", [(f"wallet:{qt['wallet']}", f"fx:pool:{qt['sell_ccy']}", qt["sell"], asset(qt["sell_ccy"])),
                                               (f"fx:pool:{qt['buy_ccy']}", f"wallet:{qt['wallet']}", qt["buy"], asset(qt["buy_ccy"]))],
                             metadata={"type": "fx", "rate": qt["rate"]})
-        except InsufficientFunds as e:
+        except InsufficientFunds:
             raise Declined("insufficient funds or no FX inventory in the target currency")
         self.x("update quotes set status='used' where id=?", qt["id"])
         return {"status": "converted", "sold": qt["sell"], "bought": qt["buy"], "rate": qt["rate"], "ledger_tx": r["id"], "duplicate": r["dup"]}
@@ -705,7 +706,7 @@ class Treasury:
     # ------------------------------------------------------------------------------------------- sweeps & liquidity
     def sweep(self, d):
         self._need(d, "ref", "from", "to", "ccy")
-        a, ccy = asset(d["ccy"]), d["ccy"]
+        a = asset(d["ccy"])
         if d.get("mode", "all") == "all":
             bal = self.led.balance(d["from"], a)
             if bal <= 0:

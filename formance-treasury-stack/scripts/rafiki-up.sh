@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Rafiki (Interledger) native local bring-up: auth + backend against Postgres/Redis containers.
 # Usage: rafiki-up.sh <formance-dir>   (needs git, docker, node 24 on PATH or $NODE24_BIN)
 set -euo pipefail

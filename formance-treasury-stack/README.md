@@ -1,6 +1,6 @@
 # Formance treasury stack
 
-Ledger-first treasury, payments and card-authorization engine on **Formance Community Edition (MIT)**, with **Rafiki** (Interledger / Open Payments) in front and bank rails behind. Built to run on **GKE**.
+Open-source (Apache-2.0), ledger-first treasury, payments and card-authorization engine built on **Formance** (Ledger v3 over its HTTP API), with **Rafiki** (Interledger / Open Payments) in front and bank rails behind. Built to run on **GKE**.
 
 > **Status: hardened and sandbox-verified; not yet production-approved.** The engine has crash-safe money flows, request-bound idempotency,
 > signed-request auth with scopes, Postgres state, observability and graceful shutdown, verified by **181 automated checks** (SQLite and
@@ -40,6 +40,13 @@ LEDGER_BIN=$PWD/ledger/ledger-bin LEDGERCTL=$PWD/ledger/ledgerctl ./treasury/run
 ```
 The harness starts a Ledger, creates the ledger **and its required `reference` index**, runs the functional suite (84 checks), the resilience/security suite (89), a graceful-shutdown check and six production-preflight refusals. In constrained sandboxes the Ledger may refuse writes on disk-usage health checks; pass `LEDGER_EXTRA_FLAGS="--health-wal-threshold 0.99 --health-data-threshold 0.99"`.
 
+## Open source and free - what that does and does not mean
+
+- **This project's code is Apache-2.0** (`LICENSE`, `NOTICE`); contributions are welcome (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`). The engine uses only the Python standard library plus the PostgreSQL driver (psycopg, LGPL-3.0, used unmodified).
+- **Free to run locally:** `make test` (SQLite), `make test-pg`, and the (untested-as-a-whole) `deploy/docker-compose.yml` need only a machine. Infrastructure-as-code works with **OpenTofu** (MPL-2.0, preferred) or Terraform (BUSL-1.1, source-available).
+- **Not free of cost:** cloud resources (GKE, Cloud SQL), bank and card-network access, FX liquidity, and compliance work are paid, third-party matters. See `docs/COMPLIANCE.md`: this is software, not a bank, and operators must hold the licences their activity requires.
+- **Unresolved licence gap:** Formance **Ledger v3 published no licence terms** in the revision this was tested against (`THIRD_PARTY.md`). The engine bundles none of its code, but you need written terms (or a licensed release, or a different ledger behind `treasury/ledger.py`) before production use or redistribution of the full stack. Formance Payments' Community Edition is MIT only if you have no registered Formance cloud account; its `ee/` code is separately licensed and not used here.
+
 ## Layout
 
 ```
@@ -56,7 +63,7 @@ Rail windows and limits in `treasury/rails.py` are **defaults to confirm with ea
 
 ## Known gaps before production
 
-See [docs/PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md) section 3-4. In short: real bank adapters and issuer-processor integration; a real GKE plan/apply (Terraform only validated offline); the container image build (Docker Hub rate-limited the base image in the sandbox); Ledger HA (single node); live Rafiki webhook signing; sanctions/AML; load/chaos/DR drills; independent security review. Hyperswitch (`scripts/hyperswitch-lite-up.sh`) was not brought up: its Rust build ran out of memory in the sandbox; the engine does not need it. Formance Enterprise (`ee/`) is not used (stays on MIT Community Edition).
+See [docs/PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md) section 3-4. In short: real bank adapters and issuer-processor integration; a real GKE plan/apply (Terraform only validated offline); the container image build (Docker Hub rate-limited the base image in the sandbox); Ledger HA (single node); live Rafiki webhook signing; sanctions/AML; load/chaos/DR drills; independent security review. Hyperswitch (`scripts/hyperswitch-lite-up.sh`) was not brought up: its Rust build ran out of memory in the sandbox; the engine does not need it. Formance Enterprise (`ee/`) is not used.
 
 ## Safety notes
 

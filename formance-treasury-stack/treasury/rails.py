@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Payment rail catalog and availability calendar (America/New_York).
 
 THE WINDOWS BELOW ARE DEFAULTS FOR ROUTING DECISIONS, NOT A SOURCE OF TRUTH. Operators (Fed, TCH) and each bank publish their own

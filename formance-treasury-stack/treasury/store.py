@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Operational state store. One code path for SQLite (dev/tests) and PostgreSQL (production, required for >1 replica).
 
 The Ledger holds all money. This store holds only workflow state: payout/auth records, card controls, quotes, facility terms,

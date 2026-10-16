@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Bank adapter interface + a faithful mock, plus production adapter stubs.
 
 The engine never talks to a bank except through BankAdapter. To go live you implement the same methods against the bank's

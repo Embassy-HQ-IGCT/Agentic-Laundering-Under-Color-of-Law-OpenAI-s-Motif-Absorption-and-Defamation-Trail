@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 locals {
   apis = [
     "container.googleapis.com", "compute.googleapis.com", "sqladmin.googleapis.com",

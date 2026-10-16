@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 output "cluster_name" { value = google_container_cluster.gke.name }
 output "cluster_location" { value = google_container_cluster.gke.location }
 output "sql_private_ip" { value = google_sql_database_instance.pg.private_ip_address }

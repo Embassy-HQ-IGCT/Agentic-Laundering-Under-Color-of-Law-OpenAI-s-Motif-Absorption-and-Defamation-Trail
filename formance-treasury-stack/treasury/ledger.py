@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """REST client for Formance Ledger v3 (HTTP :9000). Stdlib only, one keep-alive connection per thread, TCP_NODELAY.
 
 Every money movement is ONE atomic ledger transaction identified by a unique `reference`:

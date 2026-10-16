@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # gke-deploy.sh - collect GKE cluster details, then provision and deploy the treasury stack:
 #   Terraform  : VPC, private GKE Autopilot, Cloud SQL (Postgres), Memorystore (Redis), Artifact Registry, Secret Manager, Workload Identity
 #   kubectl    : Temporal, Formance Payments (community), Formance Ledger v3, Rafiki->Ledger bridge
@@ -19,7 +20,11 @@ while [ $# -gt 0 ]; do case "$1" in
   --config) CONFIG="$2"; shift ;; --non-interactive) INTERACTIVE=0 ;; --out) OUT="$2"; shift ;;
   -h|--help) sed -n '2,15p' "$0"; exit 0 ;; *) echo "unknown flag $1" >&2; exit 2 ;; esac; shift; done
 mkdir -p "$OUT"
+# shellcheck disable=SC1090  # user-supplied answers file
 [ -n "$CONFIG" ] && { set -a; . "$CONFIG"; set +a; }
+
+# Infrastructure-as-code engine: OpenTofu (MPL-2.0, open source) is preferred; HashiCorp Terraform (BUSL-1.1) works too. Override with TF=/path.
+TF="${TF:-$(command -v tofu || command -v terraform || true)}"
 
 say(){ printf '\n== %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
@@ -28,7 +33,7 @@ ask(){ # ask VAR "Prompt" default [secret-free validation regex]
   [ -n "$cur" ] && def="$cur"
   while :; do
     if [ "$INTERACTIVE" = 1 ]; then read -r -p "$prompt${def:+ [$def]}: " ans || true; ans="${ans:-$def}"; else ans="$def"; fi
-    [[ "$ans" =~ $re ]] && [ -n "$ans" ] && { printf -v "$var" '%s' "$ans"; export "$var"; return; }
+    [[ "$ans" =~ $re ]] && [ -n "$ans" ] && { printf -v "$var" '%s' "$ans"; export "${var?}"; return; }
     [ "$INTERACTIVE" = 1 ] && echo "  invalid or empty, try again" || die "$var missing or invalid (--non-interactive)"
   done
 }
@@ -93,13 +98,14 @@ list(yaml.safe_load_all(open(f"{out}/platform.yaml")))
 print("rendered: terraform.tfvars.json platform.yaml rafiki-{backend,auth,frontend}.values.yaml")
 EOF
 
-if command -v terraform >/dev/null; then
-  ( cd "$HERE/terraform" && terraform init -backend=false >/dev/null 2>&1 && terraform validate >/dev/null && echo "terraform config valid" ) || echo "WARN: terraform validate did not pass (provider mirror/registry access?)"
+if [ -n "$TF" ]; then
+  ( cd "$HERE/terraform" && "$TF" init -backend=false >/dev/null 2>&1 && "$TF" validate >/dev/null && echo "infrastructure config valid ($(basename "$TF"))" ) || echo "WARN: $(basename "$TF") validate did not pass (provider registry access?)"
 fi
 [ "$MODE" = render ] && { echo "render-only: done. Review $OUT"; exit 0; }
 
 say "Preflight"
-for t in gcloud terraform kubectl helm envsubst python3; do command -v "$t" >/dev/null || die "missing tool: $t"; done
+for t in gcloud kubectl helm envsubst python3; do command -v "$t" >/dev/null || die "missing tool: $t"; done
+[ -n "$TF" ] || die "missing tool: tofu (preferred, open source) or terraform"
 ACCT=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1)
 [ -n "$ACCT" ] || die "no active gcloud account: run 'gcloud auth login' and 'gcloud auth application-default login'"
 echo "gcloud account: $ACCT"
@@ -110,7 +116,7 @@ gcloud compute regions describe "$REGION" --project "$PROJECT_ID" --format='valu
 echo "preflight ok"
 
 say "Terraform plan"
-( cd "$HERE/terraform" && terraform init -input=false >/dev/null && terraform plan -input=false -var-file="$OUT/terraform.tfvars.json" -out="$OUT/tfplan" )
+( cd "$HERE/terraform" && "$TF" init -input=false >/dev/null && "$TF" plan -input=false -var-file="$OUT/terraform.tfvars.json" -out="$OUT/tfplan" )
 [ "$MODE" = plan ] && { echo "plan only: nothing was created. Re-run with --apply to provision and deploy."; exit 0; }
 
 say "Confirm"
@@ -118,8 +124,8 @@ echo "About to PROVISION billable resources in project '$PROJECT_ID' ($REGION) a
 read -r -p "Type the project ID to continue: " c; [ "$c" = "$PROJECT_ID" ] || die "confirmation did not match; aborting"
 
 say "Terraform apply"
-( cd "$HERE/terraform" && terraform apply -input=false "$OUT/tfplan" )
-tf(){ ( cd "$HERE/terraform" && terraform output -raw "$1" ); }
+( cd "$HERE/terraform" && "$TF" apply -input=false "$OUT/tfplan" )
+tf(){ ( cd "$HERE/terraform" && "$TF" output -raw "$1" ); }
 SQL_IP=$(tf sql_private_ip); REDIS_HOST=$(tf redis_host); REDIS_PORT=$(tf redis_port); export SQL_IP REDIS_HOST REDIS_PORT
 gcloud container clusters get-credentials "$NAME" --region "$REGION" --project "$PROJECT_ID"
 

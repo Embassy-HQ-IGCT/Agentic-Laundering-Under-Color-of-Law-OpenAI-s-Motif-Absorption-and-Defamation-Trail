@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Full local verification: single-node Formance Ledger v3 + the treasury engine, then
 #   1. functional end-to-end suite   2. resilience/security suite   3. graceful shutdown   4. production preflight refusals
 # Needs: a Ledger v3 server binary and ledgerctl (clone formancehq/ledger; go build -o ledger-bin . ; go build -o ledgerctl ./cmd/ledgerctl), python3 >= 3.9.

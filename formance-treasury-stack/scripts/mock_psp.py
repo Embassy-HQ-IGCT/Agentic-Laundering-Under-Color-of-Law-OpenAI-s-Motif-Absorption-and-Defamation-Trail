@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Mock PSP implementing the Formance generic-connector API. Bearer token must be 'test-key'."""
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
