@@ -25,6 +25,8 @@ One service (`treasury/`) on top of the Ledger. **Every balance lives in the Led
 
 Measured here: card authorization **p50 ≈ 11 ms, p95 ≈ 12 ms** end to end over HTTP (single node, sandbox).
 
+**Fast path and every blocker we hit (with fixes): [docs/RUNBOOK.md](docs/RUNBOOK.md).**
+
 ## Run the tests
 
 ```bash
