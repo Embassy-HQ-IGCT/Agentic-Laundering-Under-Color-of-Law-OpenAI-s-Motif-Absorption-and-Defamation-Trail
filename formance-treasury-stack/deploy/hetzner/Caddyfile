@@ -1,0 +1,6 @@
+{$DOMAIN} {
+	encode zstd gzip
+	@api path /bank/* /payouts* /wallets/* /transfers* /recon/* /cards* /card/* /rails /rates /guarantees* /fx* /credit* /sweeps* /liquidity* /rafiki/* /livez /readyz
+	reverse_proxy @api engine:8200
+	respond 404
+}

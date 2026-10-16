@@ -205,6 +205,9 @@ def load_banks():
     for c in cfg:
         if c["type"] == "mock":
             banks[c["name"]] = MockBank(c["name"], c["rails"], c["ccys"], c.get("opening"), c.get("limits"))
+        elif c["type"] == "manual":
+            from manualbank import ManualBank          # operator-assisted live channel (no bank API needed)
+            banks[c["name"]] = ManualBank(c)
         elif c["type"] == "bofa":
             banks[c["name"]] = BofACashProAdapter(c)
         elif c["type"] == "nfcu":

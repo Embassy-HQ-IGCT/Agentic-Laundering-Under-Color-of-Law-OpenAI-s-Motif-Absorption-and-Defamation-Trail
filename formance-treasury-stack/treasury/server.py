@@ -273,6 +273,18 @@ def _(h, b, m): return T.guarantee_release(b)
 @route("POST", "/recon/([^/]+)", "recon")
 def _(h, b, m): return T.reconcile(m[0], now_of(h), (b or {}).get("since"))
 
+@route("GET", "/bank/([^/]+)/instructions", "bank:ops")
+def _(h, b, m): return T.manual_instructions(m[0], h.query.get("status"))
+
+@route("POST", "/bank/([^/]+)/instructions/([^/]+)/sent", "bank:ops")
+def _(h, b, m): return T.manual_sent(m[0], m[1], b)
+
+@route("POST", "/bank/([^/]+)/instructions/([^/]+)/failed", "bank:ops")
+def _(h, b, m): return T.manual_failed(m[0], m[1], b)
+
+@route("POST", "/bank/([^/]+)/statement", "bank:ops")      # body: {"format": "csv"|"bai2", "content": "..."}; raise MAX_BODY_BYTES for big files
+def _(h, b, m): return T.manual_statement(m[0], now_of(h), b)
+
 @route("POST", "/bank/([^/]+)/credit", "webhook:bank")
 def _(h, b, m): return T.apply_inbound(m[0], b)
 

@@ -59,6 +59,23 @@ python3 "$HERE/tests/e2e.py" 127.0.0.1:18200 "${RAFIKI_WEBHOOKS:-}" || RC=1
 echo "################ resilience + security suite"
 python3 "$HERE/tests/resilience.py" 127.0.0.1:18200 "${RAFIKI_WEBHOOKS:-}" || RC=1
 
+echo "################ operator-assisted bank (manual channel): instruction out, CSV/BAI2 statement in"
+MP=""
+curl -fsS -X POST "localhost:19000/v3/manualflow" -H 'content-type: application/json' -d '{}' >/dev/null
+"$LEDGERCTL" --server localhost:18888 indexes create --ledger manualflow --type reference >/dev/null
+for _ in $(seq 60); do
+  curl -fs -G "localhost:19000/v3/manualflow/transactions" --data-urlencode 'pageSize=1' --data-urlencode 'filter={"$match":{"reference":"probe"}}' >/dev/null 2>&1 && break
+  sleep 0.5
+done
+env PYTHONDONTWRITEBYTECODE=1 HOME=/nonexistent TREASURY_ENV=test TREASURY_BG=0 TREASURY_API_KEYS="$KEYS" RAFIKI_WEBHOOK_SECRET="$RAFIKI_SECRET" \
+    LEDGER_URL=http://127.0.0.1:19000 LEDGER_NAME=manualflow PORT=18210 METRICS_PORT=19110 \
+    BANKS_JSON='[{"name":"bofa","type":"manual","rails":["FEDWIRE","SWIFT"],"ccys":["USD"]}]' \
+    DATABASE_URL="${PG_URL:-sqlite:///$W/manual.db}" python3 -I "$SRC/server.py" > "$W/engine-manual.log" 2>&1 &
+MP=$!
+for _ in $(seq 60); do curl -fs localhost:18210/livez >/dev/null 2>&1 && break; sleep 0.25; done
+python3 "$HERE/tests/manual_flow.py" 127.0.0.1:18210 || RC=1
+kill -TERM $MP 2>/dev/null; wait $MP 2>/dev/null
+
 echo "################ graceful shutdown"
 kill -TERM $EP
 for _ in $(seq 40); do kill -0 $EP 2>/dev/null || break; sleep 0.25; done

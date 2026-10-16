@@ -150,6 +150,9 @@ class Treasury:
     def __init__(self, ledger, banks, store=None, fx_rates=None, fx_spread_bps=40, auth_ttl_h=168, quote_ttl_s=30, lease_s=30):
         self.led, self.banks = ledger, banks
         self.db = store or Store(":memory:")
+        for bk in self.banks.values():
+            if hasattr(bk, "bind"):
+                bk.bind(self.db)          # operator-assisted banks keep their queue/statement state in the same Store
         self.rails, self.hol = railmod.load_rails(), railmod.holidays()
         self.fx_mid = fx_rates or {"EURUSD": 1.0850, "GBPUSD": 1.2700}
         self.fx_spread_bps, self.auth_ttl_h, self.quote_ttl_s, self.lease_s = fx_spread_bps, auth_ttl_h, quote_ttl_s, lease_s
@@ -855,6 +858,42 @@ class Treasury:
         return {"guarantee_id": gid, "collateral_returned": left, "status": "released"}
 
     # ------------------------------------------------------------------------------------------- inbound & reconciliation
+    # --- operator-assisted banks (type "manual"): the human-in-the-loop leg of a live channel ---------------------------
+    def _manual(self, name):
+        b = self.banks.get(name)
+        if b is None or not hasattr(b, "mark_sent"):
+            raise NotFound(f"{name} is not an operator-assisted bank")
+        return b
+
+    def manual_instructions(self, name, status=None):
+        return {"bank": name, "instructions": self._manual(name).instructions(status)}
+
+    def manual_sent(self, name, payment_id, d):
+        r = self._manual(name).mark_sent(payment_id, str((d or {}).get("sent_ref", "")))
+        self.audit("manual_sent", payment_id, r)
+        return r
+
+    def manual_failed(self, name, payment_id, d):
+        try:
+            r = self._manual(name).mark_failed(payment_id, str((d or {}).get("reason", "operator")))
+        except ValueError as ex:
+            raise Declined(str(ex))
+        self.audit("manual_failed", payment_id, r)
+        return r
+
+    def manual_statement(self, name, now, d):
+        d = d or {}
+        if d.get("format") not in ("csv", "bai2") or not isinstance(d.get("content"), str):
+            raise ValidationError("body needs format ('csv'|'bai2') and content (string)")
+        try:
+            r = self._manual(name).ingest(d["format"], d["content"])
+        except ValueError as ex:
+            raise ValidationError(str(ex))
+        r["advanced"] = self.poll_payouts(now)       # settle/fail payouts the new statement resolved
+        r["reconcile"] = self.reconcile(name, now)
+        self.audit("manual_statement", name, {k: r[k] for k in ("lines", "new", "settled")})
+        return r
+
     def apply_inbound(self, bank, e):
         """Post a bank credit to the Ledger (idempotent on bank_ref). Attributable via narrative 'WALLET:<id>', else suspense."""
         self._need(e, "bank_ref", "ccy", "amount", "narrative")

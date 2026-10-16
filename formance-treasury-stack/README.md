@@ -57,7 +57,7 @@ scripts/           earlier building blocks: Formance CE install + e2e, Rafiki lo
 
 ## Bank connectivity: what is real and what is not
 
-`treasury/banks.py` defines the `BankAdapter` interface (balance, submit, status, statement, healthy). **Only `MockBank` is implemented.** `BofACashProAdapter` and `NavyFederalAdapter` are stubs that raise until implemented against the interfaces those banks enable for your accounts (credentials, entitlements and API specs are required and were not available). The engine **refuses to start with mock banks** unless `TREASURY_ALLOW_MOCK_BANKS=1`, so simulated payments cannot be mistaken for real ones.
+`treasury/banks.py` defines the `BankAdapter` interface (balance, submit, status, statement, healthy). **`MockBank` (tests) and `ManualBank` (operator-assisted live wires + statement ingest, see `deploy/hetzner/README.md`) are implemented.** `BofACashProAdapter` and `NavyFederalAdapter` are stubs that raise until implemented against the interfaces those banks enable for your accounts (credentials, entitlements and API specs are required and were not available). The engine **refuses to start with mock banks** unless `TREASURY_ALLOW_MOCK_BANKS=1`, so simulated payments cannot be mistaken for real ones.
 
 Rail windows and limits in `treasury/rails.py` are **defaults to confirm with each bank/operator** (override with `TREASURY_RAILS_JSON`, `TREASURY_HOLIDAYS`). Rail participation per bank (e.g. whether Navy Federal supports FedNow/RTP for business accounts) is an assumption in the default mock config.
 
