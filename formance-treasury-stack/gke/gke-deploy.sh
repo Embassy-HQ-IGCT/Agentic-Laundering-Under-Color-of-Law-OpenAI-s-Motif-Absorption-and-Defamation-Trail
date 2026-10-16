@@ -63,6 +63,7 @@ ask ALLOW_MOCK_BANKS "Run the treasury engine with SIMULATED banks? 1 = sandbox/
 export LEDGER_CLUSTER_ID="${NAME}-ledger" KSA="${NAME}-app" APP_GSA="${NAME}-app@${PROJECT_ID}.iam.gserviceaccount.com"
 export REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${NAME}-images"
 export BRIDGE_IMAGE="${REGISTRY}/rafiki-ledger-bridge:1" ENGINE_IMAGE="${REGISTRY}/treasury-engine:1"
+export INGRESS_NAMESPACE="${INGRESS_NAMESPACE:-ingress-nginx}" MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}" VPC_CIDR="${VPC_CIDR:-10.0.0.0/8}"
 
 say "Rendering files into $OUT"
 BANKS_JSON=$(python3 -c "import json,os;print(json.dumps([s for s in os.environ['BANK_SECRETS'].split(',') if s]))")
@@ -82,6 +83,7 @@ EOF
 export SQL_IP REDIS_HOST REDIS_PORT
 envsubst < "$HERE/k8s/platform.yaml.tmpl" > "$OUT/platform.yaml"
 envsubst < "$HERE/k8s/rafiki-values.yaml.tmpl" > "$OUT/rafiki-values.yaml"
+python3 "$HERE/validate-manifests.py" "$OUT/platform.yaml" || die "rendered manifests failed the hardening checks"
 python3 - "$OUT" <<'EOF'
 import sys, yaml
 out = sys.argv[1]; v = yaml.safe_load(open(f"{out}/rafiki-values.yaml"))
@@ -134,6 +136,26 @@ kubectl -n "$NAMESPACE" create secret generic db-passwords --from-literal=tempor
 kubectl -n "$NAMESPACE" create secret generic app-secrets \
   --from-literal=payments-postgres-uri="postgres://payments:$(dbpw payments)@${SQL_IP}:5432/payments?sslmode=disable" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# Engine credentials. Each API client gets its OWN key with minimal scopes; the key material lives in Secret Manager
+# (${NAME}-engine-key-<client>) so clients fetch it from there. Rotate by adding a secret version and re-running this script.
+K_CARD=$(ensure "${NAME}-engine-key-card-processor"); K_API=$(ensure "${NAME}-engine-key-payments-api"); K_OPS=$(ensure "${NAME}-engine-key-ops")
+API_KEYS=$(python3 - "$K_CARD" "$K_API" "$K_OPS" <<'KEYEOF'
+import json, sys
+c, a, o = sys.argv[1:]
+keys = {
+  "card-processor": {"secret": c, "scopes": ["card"], "rps": 500},
+  "payments-api":   {"secret": a, "scopes": ["read", "transfer", "payout", "fx", "credit", "guarantee", "sweep"], "rps": 200},
+  "ops":            {"secret": o, "scopes": ["read", "payout:admin", "card:admin", "credit:admin", "recon", "webhook:bank"], "rps": 50},
+}
+assert all(len(k["secret"]) >= 32 for k in keys.values()), "generated key too short"
+print(json.dumps(keys))
+KEYEOF
+)
+RAFIKI_WH=$(ensure "${NAME}-rafiki-webhook-secret")
+kubectl -n "$NAMESPACE" create secret generic treasury-engine-env \
+  --from-literal=DATABASE_URL="postgresql://treasury:$(dbpw treasury)@${SQL_IP}:5432/treasury?sslmode=require" \
+  --from-literal=TREASURY_API_KEYS="$API_KEYS" --from-literal=RAFIKI_WEBHOOK_SECRET="$RAFIKI_WH" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n "$NAMESPACE" create secret generic payments-env \
   --from-literal=POSTGRES_URI="postgres://payments:$(dbpw payments)@${SQL_IP}:5432/payments?sslmode=disable" \
   --from-literal=CONFIG_ENCRYPTION_KEY="$CEK" --from-literal=PLUGIN_MAGIC_COOKIE="$COOKIE" \
@@ -148,9 +170,9 @@ EOF
 gcloud builds submit "$BCTX" --project "$PROJECT_ID" --config "$BCTX/cloudbuild.yaml"; rm -rf "$BCTX"
 
 say "Treasury engine image (Cloud Build)"
-ECTX=$(mktemp -d); cp "$HERE"/../treasury/{ledger,rails,banks,engine,server}.py "$HERE/k8s/Dockerfile.treasury" "$ECTX/"
+ECTX=$(mktemp -d); cp "$HERE"/../treasury/{ledger,rails,banks,engine,server,store}.py "$HERE/../treasury/requirements.txt" "$HERE/../treasury/Dockerfile" "$ECTX/"
 cat > "$ECTX/cloudbuild.yaml" <<CBEOF
-steps: [{ name: gcr.io/cloud-builders/docker, args: [build, -f, Dockerfile.treasury, -t, "${ENGINE_IMAGE}", .] }]
+steps: [{ name: gcr.io/cloud-builders/docker, args: [build, -t, "${ENGINE_IMAGE}", .] }]
 images: ["${ENGINE_IMAGE}"]
 CBEOF
 gcloud builds submit "$ECTX" --project "$PROJECT_ID" --config "$ECTX/cloudbuild.yaml"; rm -rf "$ECTX"
@@ -159,6 +181,7 @@ say "Deploy platform workloads"
 envsubst < "$HERE/k8s/platform.yaml.tmpl" > "$OUT/platform.yaml"
 kubectl apply -f "$OUT/platform.yaml"
 kubectl -n "$NAMESPACE" wait --for=condition=complete job/payments-migrate --timeout=600s
+kubectl -n "$NAMESPACE" wait --for=condition=complete job/ledger-bootstrap --timeout=600s
 for d in temporal payments-server payments-worker rafiki-ledger-bridge; do kubectl -n "$NAMESPACE" rollout status deploy/$d --timeout=600s; done
 kubectl -n "$NAMESPACE" rollout status sts/ledger --timeout=600s
 if [ "$ALLOW_MOCK_BANKS" = 1 ]; then kubectl -n "$NAMESPACE" rollout status sts/treasury-engine --timeout=300s
@@ -185,5 +208,7 @@ kubectl -n "$NAMESPACE" exec deploy/payments-server -- wget -qO- http://localhos
 kubectl -n "$NAMESPACE" run ledger-smoke --rm -i --restart=Never --image="$LEDGER_IMAGE" --command -- \
   /app/ledgerctl --insecure --server ledger-0.ledger:8888 ledgers list >/dev/null && echo "ledger reachable"
 echo
+echo "IMPORTANT: configure Rafiki's webhook signing secret (SIGNATURE_SECRET) to the value of Secret Manager secret ${NAME}-rafiki-webhook-secret"
+echo "           (the Rafiki chart key for it is not verified); until then the engine rejects every Rafiki webhook by design."
 echo "Done. Next steps (manual, by design): add bank/PSP credential versions to the *-bank-* secrets, point DNS + TLS at the services,"
 echo "create the 'rafiki' ledger (ledgerctl ledgers create rafiki), then install your bank connectors via the Payments API."

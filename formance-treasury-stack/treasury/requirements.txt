@@ -1,0 +1,2 @@
+# Only the PostgreSQL driver is third-party; everything else is Python stdlib. Pin exactly; add --require-hashes in your build.
+psycopg[binary]==3.2.3

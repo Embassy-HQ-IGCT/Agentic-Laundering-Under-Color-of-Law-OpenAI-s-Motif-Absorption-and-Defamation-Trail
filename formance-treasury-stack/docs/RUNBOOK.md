@@ -11,7 +11,7 @@ The scripted path is fast; the session that produced these scripts was not (expl
 | Formance CE: clone + build Ledger and Payments (community build), start Postgres + Temporal, migrate, start server + worker, health-check | `scripts/install-formance-ce.sh <dir>` | **~3 min cold** (Go builds dominate); **26 s warm** |
 | Formance CE end-to-end test (17 checks, mock PSP through Temporal) | `scripts/e2e-test.sh <dir>` | < 1 min |
 | Rafiki: Node 24, `pnpm install`, build auth + backend, Postgres/Redis, start | `scripts/rafiki-up.sh <dir>` | Node 6 s + install 34 s + build 18 s + container start; **~1.5-2 min** |
-| Treasury engine + Ledger + 78 end-to-end checks | `treasury/run-local-tests.sh` | **12.7 s** (prebuilt Ledger binary) |
+| Treasury engine + Ledger, 181 automated checks (functional, resilience/security, shutdown, production refusals) | `treasury/run-local-tests.sh` | **~12 s** (prebuilt Ledger binary), same on SQLite and PostgreSQL |
 
 **Realistic total on an unrestricted machine: roughly 5-6 minutes of compute (plus first-time image pulls), i.e. inside a 5-10 minute window.** Not included: GKE (never run against a real project), real bank adapters (stubs), Hyperswitch (not brought up).
 
@@ -21,7 +21,7 @@ The scripted path is fast; the session that produced these scripts was not (expl
 export CONFIG_ENCRYPTION_KEY="$(openssl rand -hex 16)" PLUGIN_MAGIC_COOKIE="$(openssl rand -hex 8)"
 bash scripts/install-formance-ce.sh ./work          # Ledger v3 + Payments CE + Temporal; prints the 16 CE connectors
 bash scripts/e2e-test.sh ./work                     # optional: 17 checks incl. a mock PSP flowing through Temporal
-LEDGER_BIN=./work/ledger-bin treasury/run-local-tests.sh     # engine: expect "RESULT: 78 passed, 0 failed"
+LEDGER_BIN=./work/ledger-bin LEDGERCTL=./work/ledgerctl treasury/run-local-tests.sh    # engine: expect "ALL SUITES PASSED" (181 checks)
 ```
 Rafiki is optional for the engine tests (webhooks are replayed from recorded events); run `scripts/rafiki-up.sh ./work` and `scripts/rafiki-e2e.cjs` (from `rafiki/packages/backend`) to exercise it live (14 checks).
 
@@ -49,6 +49,13 @@ Rafiki is optional for the engine tests (webhooks are replayed from recorded eve
 | 18 | 60 parallel requests: `Connection reset` | Default listen backlog of 5 | `request_queue_size = 512`. |
 | 19 | Integrity check showed a non-zero ledger sum | (a) `/accounts` pagination keys are top-level `next`/`hasMore`; (b) virtual `world` is not listed | Follow `next`; add `world` explicitly. Sum is now exactly 0. |
 | 20 | `git push` 403: "Claude doesn't have GitHub access to <org>/<repo>" | The Claude GitHub App/token has no write access to that repository; repo creation is also not permitted for the integration | Reconnect GitHub at https://claude.ai/connect-github, install the Claude GitHub App on the target org/repo, or push from your own machine (see section 5). |
+| 21 | Duplicate / crash recovery silently failed to find the original transaction | The Ledger's `reference=` query parameter is **ignored** (returns the latest page); the `filter` form fails with `INDEX_NOT_FOUND` unless a `reference` index exists | Create the index once per ledger: `ledgerctl indexes create --ledger <name> --type reference` (the harness and the K8s `ledger-bootstrap` Job do it); the engine refuses to start without it. For a known duplicate, fetch by the id in the 409 message. |
+| 22 | `KeyError: 'id'` from a duplicate lookup, reported as HTTP 400 | `GET /transactions/{id}` nests the object under `data.transaction`; and the server mapped bare `KeyError` to 400, hiding the bug | Unwrap `data.transaction`; use a dedicated `NotFound` for unknown ids so genuine bugs surface as 500. |
+| 23 | Crash tests "passed" without crashing | The test client auto-retried the dropped connection, re-running the request | `retry=False` for fault-injection calls. |
+| 24 | Harness left a Ledger running; next run exited 22 | `kill $!` hit the wrapper subshell, not the Ledger | `exec` the Ledger inside the subshell; wait for it in the cleanup trap. |
+| 25 | Harness exited 1 although every check passed | `set -e` inside the EXIT trap overrode the real status | Capture `$?` first, `set +e`, `exit $rc` at the end of the trap. |
+| 26 | Hardened (uid 10001) run: engine never started | Harness temp dir was root-only | `chmod a+rx` the temp dir. |
+| 27 | Container image could not be built in the sandbox | Docker Hub 429 on `python:3.12-slim`; and in-container `pip` is blocked by the proxy's TLS interception | Unverified here. In a normal environment `docker build treasury/` works; in a proxied one pre-download wheels and `pip install --no-index --find-links`. |
 
 ## 4. Licensing note
 
@@ -56,7 +63,7 @@ Everything here runs on the MIT Community Edition (16 connectors). `ee/` code (6
 
 ## 5. Getting this code onto GitHub
 
-The session's pre-attached repository refused the push (blocker 20), and creating a new repository is not permitted for the integration. Simplest route from any machine with access:
+The session's pre-attached repository refused the push (blocker 20); creating a new repository is not permitted for the integration; and attaching `IGCT-Foreign-Authority/hyperswitch` with push access was accepted but reported `push_check: refused` (the Claude GitHub App has no write access there either). The fix is on the GitHub side: install/authorise the Claude GitHub App on the target repository. Simplest route from any machine with access:
 
 ```bash
 git bundle create formance-treasury-stack.bundle claude/full-deployment-all-connectors-exi0oz   # or copy the directory

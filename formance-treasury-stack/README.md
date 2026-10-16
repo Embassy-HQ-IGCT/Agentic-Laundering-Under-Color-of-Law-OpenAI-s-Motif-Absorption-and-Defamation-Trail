@@ -2,7 +2,10 @@
 
 Ledger-first treasury, payments and card-authorization engine on **Formance Community Edition (MIT)**, with **Rafiki** (Interledger / Open Payments) in front and bank rails behind. Built to run on **GKE**.
 
-> **Status: sandbox-verified, not production-ready.** Everything below marked *tested* was run end to end in a sandbox against a real Formance Ledger v3. Bank connectivity is **simulated** (mock banks that enforce real rail windows, limits and liquidity). No real bank, card network or Google Cloud project was touched.
+> **Status: hardened and sandbox-verified; not yet production-approved.** The engine has crash-safe money flows, request-bound idempotency,
+> signed-request auth with scopes, Postgres state, observability and graceful shutdown, verified by **181 automated checks** (SQLite and
+> PostgreSQL, plus a run as an unprivileged user from a read-only tree). Bank connectivity is still **simulated**, and nothing has run against a real
+> cluster, bank or card network. See **[docs/PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md)** for exactly what is and is not covered, and the go-live checklist.
 
 ## What it does
 
@@ -23,22 +26,24 @@ One service (`treasury/`) on top of the Ledger. **Every balance lives in the Led
 | **Rafiki intake** | Rafiki webhooks (replayed from real recorded events) post into the same wallets, idempotent on event id. | tested (recorded events) |
 | **Ledger integrity** | Sum of all balances incl. `world` is exactly 0 for USD and EUR after the whole run. | tested |
 
-Measured here: card authorization **p50 ≈ 11 ms, p95 ≈ 12 ms** end to end over HTTP (single node, sandbox).
+Measured here: card authorization **p50 ≈ 11 ms, p95 ≈ 13-18 ms** end to end over HTTP including signature verification and audit (single node, sandbox).
 
 **Fast path and every blocker we hit (with fixes): [docs/RUNBOOK.md](docs/RUNBOOK.md).**
 
 ## Run the tests
 
 ```bash
-git clone https://github.com/formancehq/ledger && (cd ledger && go build -o ledger-bin .)
-LEDGER_BIN=$PWD/ledger/ledger-bin ./treasury/run-local-tests.sh      # expect: RESULT: 78 passed, 0 failed
+git clone https://github.com/formancehq/ledger && (cd ledger && go build -o ledger-bin . && go build -o ledgerctl ./cmd/ledgerctl)
+LEDGER_BIN=$PWD/ledger/ledger-bin LEDGERCTL=$PWD/ledger/ledgerctl ./treasury/run-local-tests.sh   # SQLite;  expect: ALL SUITES PASSED
+# same suites on PostgreSQL:        PG_URL=postgresql://user:pw@host:5432/db  (pip install -r treasury/requirements.txt)
+# as the container will run it:     HARDENED_RUN=1  (uid 10001, read-only source tree)
 ```
-In constrained sandboxes the Ledger may refuse writes on disk-usage health checks; pass `LEDGER_EXTRA_FLAGS="--health-wal-threshold 0.99 --health-data-threshold 0.99"`.
+The harness starts a Ledger, creates the ledger **and its required `reference` index**, runs the functional suite (84 checks), the resilience/security suite (89), a graceful-shutdown check and six production-preflight refusals. In constrained sandboxes the Ledger may refuse writes on disk-usage health checks; pass `LEDGER_EXTRA_FLAGS="--health-wal-threshold 0.99 --health-data-threshold 0.99"`.
 
 ## Layout
 
 ```
-treasury/          engine (ledger client, rails calendar, bank adapters, workflows, HTTP API) + tests/e2e.py
+treasury/          engine (ledger client, store, rails calendar, bank adapters, workflows, HTTP API), Dockerfile, tests/ (e2e, resilience, client)
 gke/               gke-deploy.sh (prompts for cluster details; --render-only | --plan | --apply), terraform/, k8s/
 scripts/           earlier building blocks: Formance CE install + e2e, Rafiki local bring-up + e2e, Rafiki->Ledger bridge, Hyperswitch lite (unbuilt)
 ```
@@ -51,15 +56,7 @@ Rail windows and limits in `treasury/rails.py` are **defaults to confirm with ea
 
 ## Known gaps before production
 
-- Real bank adapters (BofA, Navy Federal), including the issuer-processor webhook contract for card authorization.
-- Operational state is SQLite on one PVC (not HA). Money is safe in the Ledger; move workflow state to Postgres before >1 replica.
-- Ledger is a single Raft node; HA needs added voters.
-- API has no authentication / mTLS yet; `TREASURY_ADMIN` and `TREASURY_TEST_CLOCK` must stay off outside tests.
-- Card controls/velocity are minimal (per-txn, daily, MCC, country). No sanctions screening, no AML monitoring.
-- FX assumes 2-decimal currencies; rate source is static config.
-- `gke/` Terraform passes `terraform validate`; `--plan/--apply`, the Kubernetes manifests and the Rafiki Helm values have **not** been exercised against a real cluster or project. Images are unpinned (`latest`) by default.
-- Hyperswitch (`scripts/hyperswitch-lite-up.sh`) was **not** brought up: its Rust build ran out of memory on the sandbox. It is not required by the engine.
-- Formance Enterprise (`ee/`) is not used. It is licensed separately; this stack stays on MIT Community Edition (16 connectors).
+See [docs/PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md) section 3-4. In short: real bank adapters and issuer-processor integration; a real GKE plan/apply (Terraform only validated offline); the container image build (Docker Hub rate-limited the base image in the sandbox); Ledger HA (single node); live Rafiki webhook signing; sanctions/AML; load/chaos/DR drills; independent security review. Hyperswitch (`scripts/hyperswitch-lite-up.sh`) was not brought up: its Rust build ran out of memory in the sandbox; the engine does not need it. Formance Enterprise (`ee/`) is not used (stays on MIT Community Edition).
 
 ## Safety notes
 

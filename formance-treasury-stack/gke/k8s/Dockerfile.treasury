@@ -1,7 +1,0 @@
-# Treasury engine image (stdlib-only Python). Build context = treasury/*.py
-FROM python:3.12-slim
-WORKDIR /app
-COPY ledger.py rails.py banks.py engine.py server.py /app/
-ENV PORT=8200 DB_PATH=/data/treasury.db
-EXPOSE 8200
-CMD ["python3", "-I", "/app/server.py"]

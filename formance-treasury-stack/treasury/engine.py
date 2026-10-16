@@ -18,18 +18,24 @@ Chart of accounts (all amounts integer minor units, asset "<CCY>/2"):
   world                          the outside (bank cash entering/leaving the institution)
 """
 import datetime as dt
+import hashlib
 import json
-import sqlite3
+import re
 import threading
 import time
 import uuid
 
 import rails as railmod
 from banks import AdapterError, Rejected
-from ledger import InsufficientFunds, Ledger, LedgerError
+from ledger import IdempotencyConflict, InsufficientFunds, Ledger, LedgerError
+from store import Store
 
 RESP = {"APPROVED": "00", "DO_NOT_HONOR": "05", "INSUFFICIENT_FUNDS": "51", "EXCEEDS_LIMIT": "61", "RESTRICTED": "62",
         "INVALID_CARD": "14", "SYSTEM_ERROR": "96"}
+
+ID_RE = re.compile(r"^[A-Za-z0-9._:@-]{1,96}$")
+CCY_RE = re.compile(r"^[A-Z]{3}$")
+MAX_MINOR = 10**13          # hard ceiling on any single amount (minor units)
 
 
 class Declined(Exception):
@@ -38,12 +44,28 @@ class Declined(Exception):
         self.reason, self.code = reason, code
 
 
+class ValidationError(ValueError):
+    pass
+
+
+class NotFound(Exception):
+    """Unknown payout / authorization / quote / facility id. Maps to HTTP 404 (a bare KeyError is a bug and must surface as 500)."""
+
+
+class SimulatedCrash(BaseException):
+    """Fault injection (tests only): models the process dying at a precise point. BaseException so no handler swallows it."""
+
+
 def asset(ccy):
     return f"{ccy}/2"
 
 
 def iso(d):
     return d.isoformat() if isinstance(d, dt.datetime) else d
+
+
+def _fp(*parts):
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()[:32]
 
 
 NS_ORDERED_DRAW = """vars {
@@ -118,89 +140,107 @@ send $amt (
   destination = $memo
 )"""
 
-SCHEMA = """
-create table if not exists payouts(id text primary key, wallet text, amount integer, ccy text, dest text, urgency text,
-  status text, rail text, bank text, bank_ref text, eta text, attempts text, reason text, created text, updated text);
-create table if not exists cards(card_id text primary key, wallet text, status text, per_txn_limit integer, daily_limit integer,
-  blocked_mcc text, allowed_countries text, credit_id text);
-create table if not exists auths(auth_id text primary key, card_id text, wallet text, amount integer, ccy text, merchant text,
-  mcc text, country text, status text, held_wallet integer, held_credit integer, credit_id text, captured integer default 0,
-  released integer default 0, created text, expires text, response text);
-create table if not exists quotes(id text primary key, wallet text, sell_ccy text, buy_ccy text, sell integer, buy integer,
-  rate real, expires text, status text);
-create table if not exists facilities(id text primary key, borrower text, ccy text, limit_minor integer, apr_bps integer,
-  status text, last_accrual text);
-create table if not exists guarantees(id text primary key, applicant text, beneficiary text, ccy text, amount integer,
-  collateral integer, claimed integer default 0, status text, expiry text);
-create table if not exists recon(bank text, bank_ref text, kind text, status text, detail text, primary key(bank, bank_ref));
-"""
+
+TERMINAL = ("settled", "failed")
+IN_FLIGHT = ("new", "reserved", "routing")
 
 
 class Treasury:
-    def __init__(self, ledger, banks, db_path=":memory:", fx_rates=None, fx_spread_bps=40, auth_ttl_h=168, quote_ttl_s=30):
+    def __init__(self, ledger, banks, store=None, fx_rates=None, fx_spread_bps=40, auth_ttl_h=168, quote_ttl_s=30, lease_s=30):
         self.led, self.banks = ledger, banks
-        self.db = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript(SCHEMA)
-        self.lock = threading.RLock()
+        self.db = store or Store(":memory:")
         self.rails, self.hol = railmod.load_rails(), railmod.holidays()
         self.fx_mid = fx_rates or {"EURUSD": 1.0850, "GBPUSD": 1.2700}
-        self.fx_spread_bps, self.auth_ttl_h, self.quote_ttl_s = fx_spread_bps, auth_ttl_h, quote_ttl_s
+        self.fx_spread_bps, self.auth_ttl_h, self.quote_ttl_s, self.lease_s = fx_spread_bps, auth_ttl_h, quote_ttl_s, lease_s
+        self.crash_at = None            # fault-injection point name (tests only)
+        self.ctx = threading.local()    # per-request actor / request id for audit
 
-    # ------------------------------------------------------------------------------------------- helpers
-    def q(self, sql, *a):
-        with self.lock:
-            return self.db.execute(sql, a).fetchall()
+    # ------------------------------------------------------------------------------------------- plumbing
+    def q(self, sql, *a): return self.db.q(sql, *a)
+    def q1(self, sql, *a): return self.db.q1(sql, *a)
+    def x(self, sql, *a): return self.db.x(sql, *a)
 
-    def q1(self, sql, *a):
-        r = self.q(sql, *a)
-        return dict(r[0]) if r else None
+    def _crash(self, point):
+        if self.crash_at == point:
+            self.crash_at = None
+            raise SimulatedCrash(point)
 
-    def x(self, sql, *a):
-        with self.lock:
-            self.db.execute(sql, a)
+    def audit(self, action, ref, detail=None):
+        try:
+            self.x("insert into audit values(?,?,?,?,?,?) on conflict do nothing", uuid.uuid4().hex,
+                   dt.datetime.now(dt.timezone.utc).isoformat(), getattr(self.ctx, "actor", "system"), action, ref,
+                   json.dumps(detail or {}, default=str))
+        except Exception:      # auditing must never break a money movement that already happened
+            pass
 
+    def ready(self):
+        return {"ledger": self.led.healthy(), "db": self.db.ping()}
+
+    # ------------------------------------------------------------------------------------------- validation
     @staticmethod
     def _need(d, *keys):
+        if not isinstance(d, dict):
+            raise ValidationError("body must be a JSON object")
         for k in keys:
             if d.get(k) in (None, ""):
-                raise ValueError(f"missing field: {k}")
+                raise ValidationError(f"missing field: {k}")
+
+    @staticmethod
+    def _id(d, k):
+        v = d.get(k)
+        if not isinstance(v, str) or not ID_RE.match(v):
+            raise ValidationError(f"invalid {k}: 1-96 chars of [A-Za-z0-9._:@-]")
+        return v
+
+    @staticmethod
+    def _ccy(d, k="ccy"):
+        v = d.get(k)
+        if not isinstance(v, str) or not CCY_RE.match(v):
+            raise ValidationError(f"invalid {k}: ISO 4217 code like USD")
+        return v
+
+    @staticmethod
+    def _amt(d, k="amount"):
+        v = d.get(k)
+        if isinstance(v, bool) or not isinstance(v, int) or not (0 < v <= MAX_MINOR):
+            raise ValidationError(f"invalid {k}: positive integer minor units (max {MAX_MINOR})")
+        return v
 
     # ------------------------------------------------------------------------------------------- wallets & transfers
+    def _auth_totals(self, aid):
+        r = self.q1("select coalesce(sum(amount),0) c, coalesce(sum(released),0) r from auth_events where auth_id=?", aid)
+        return int(r["c"]), int(r["r"])
+
     def wallet(self, wid, ccy="USD"):
         a = asset(ccy)
         bal = self.led.balance(f"wallet:{wid}", a)
-        held = sum(r["held_wallet"] + r["held_credit"] - r["captured"] - r["released"]
-                   for r in self.q("select * from auths where wallet=? and ccy=? and status='authorized'", wid, ccy))
+        held = 0
+        for r in self.q("select a.held_wallet hw, a.held_credit hc, coalesce(sum(e.amount),0) c, coalesce(sum(e.released),0) r "
+                        "from auths a left join auth_events e on e.auth_id=a.auth_id "
+                        "where a.wallet=? and a.ccy=? and a.status='authorized' group by a.auth_id, a.held_wallet, a.held_credit", wid, ccy):
+            held += int(r["hw"]) + int(r["hc"]) - int(r["c"]) - int(r["r"])
         fac = self.q1("select * from facilities where borrower=? and ccy=? and status='active'", wid, ccy)
         credit_avail = 0
         if fac:
-            credit_avail = max(0, fac["limit_minor"] + self.led.balance(f"credit:{fac['id']}", a))
+            credit_avail = max(0, int(fac["limit_minor"]) + self.led.balance(f"credit:{fac['id']}", a))
         return {"wallet": wid, "ccy": ccy, "balance": bal, "card_holds": held, "credit_available": credit_avail,
                 "spendable": bal + credit_avail}
 
     def transfer(self, d):
-        self._need(d, "ref", "from", "to", "amount", "ccy")
-        if int(d["amount"]) <= 0:
-            raise ValueError("amount must be positive")
+        ref, src, dst, amt, ccy = self._id(d, "ref"), self._id(d, "from"), self._id(d, "to"), self._amt(d), self._ccy(d)
         try:
-            r = self.led.tx(f"transfer:{d['ref']}", [(f"wallet:{d['from']}", f"wallet:{d['to']}", int(d["amount"]), asset(d["ccy"]))],
-                            metadata={"type": "transfer"})
+            r = self.led.tx(f"transfer:{ref}", [(f"wallet:{src}", f"wallet:{dst}", amt, asset(ccy))], metadata={"type": "transfer"})
         except InsufficientFunds:
             raise Declined("insufficient funds", "51")
+        self.audit("transfer", ref, {"from": src, "to": dst, "amount": amt, "ccy": ccy})
         return {"status": "completed", "ledger_tx": r["id"], "duplicate": r["dup"]}
 
-    # ------------------------------------------------------------------------------------------- routing & payouts
+    # ------------------------------------------------------------------------------------------- routing
     def route_plan(self, amount, ccy, dest, urgency, now):
-        """Ordered candidate routes [{bank, rail, instant, eta, fee}] honouring rail windows, limits, bank support and liquidity."""
+        """Ordered candidates [{bank, rail, instant, eta, fee, liquidity}] honouring rail windows, limits, bank support, liquidity."""
         intl = dest.get("type") == "international" or ccy != "USD"
-        if intl:
-            order = ["SWIFT"]
-        elif urgency == "instant":
-            order = ["FEDNOW", "RTP", "FEDWIRE", "ACH"]
-        else:
-            order = ["ACH", "FEDWIRE", "FEDNOW", "RTP"]
-        out = []
+        order = ["SWIFT"] if intl else (["FEDNOW", "RTP", "FEDWIRE", "ACH"] if urgency == "instant" else ["ACH", "FEDWIRE", "FEDNOW", "RTP"])
+        liq_cache, out = {}, []
         for rank, rail in enumerate(order):
             spec = self.rails[rail]
             if amount > spec["max_minor"] or (spec["ccy"] != ["*"] and ccy not in spec["ccy"]):
@@ -211,101 +251,239 @@ class Treasury:
             for bank in self.banks.values():
                 if rail not in bank.rails or (ccy not in bank.ccys and "*" not in bank.ccys) or not bank.healthy():
                     continue
-                try:
-                    liq = bank.balance(ccy)
-                except AdapterError:
+                if (bank.name, ccy) not in liq_cache:
+                    try:
+                        liq_cache[(bank.name, ccy)] = bank.balance(ccy)
+                    except AdapterError:
+                        liq_cache[(bank.name, ccy)] = None
+                liq = liq_cache[(bank.name, ccy)]
+                if liq is None or liq < amount:
                     continue
-                if liq < amount:
-                    continue
-                out.append({"bank": bank.name, "rail": rail, "instant": av["instant"], "eta": iso(av["eta"]),
-                            "fee": spec["fee_minor"], "liquidity": liq, "rank": rank})
-        # rail preference first (speed for instant / cost for standard), then most liquid bank to keep both banks funded
-        out.sort(key=lambda c: (c["rank"], -c["liquidity"]))
+                out.append({"bank": bank.name, "rail": rail, "instant": av["instant"], "eta": iso(av["eta"]), "fee": spec["fee_minor"],
+                            "liquidity": liq, "rank": rank})
+        out.sort(key=lambda c: (c["rank"], -c["liquidity"]))     # rail preference first, then the most liquid bank
         return out
 
+    # ------------------------------------------------------------------------------------------- payouts (write-ahead state machine)
+    # States: new -> reserved -> routing -> settled | accepted(in flight, polled) | review(outcome unknown) | failed.
+    # Every ledger step has a deterministic reference and every bank call is idempotent on the payout id, so ANY step can be
+    # replayed after a crash. A lease prevents two workers driving the same payout (client retry vs background recovery).
     def payout(self, d, now):
-        self._need(d, "id", "wallet", "amount", "ccy", "dest")
-        existing = self.q1("select * from payouts where id=?", d["id"])
-        if existing:
-            return self._payout_view(existing, duplicate=True)
-        amount, ccy, wid, pid = int(d["amount"]), d["ccy"], d["wallet"], d["id"]
-        if amount <= 0:
-            raise ValueError("amount must be positive")
+        pid, wid, amount, ccy = self._id(d, "id"), self._id(d, "wallet"), self._amt(d), self._ccy(d)
+        dest = d.get("dest")
+        if not isinstance(dest, dict) or dest.get("type") not in ("us_account", "international"):
+            raise ValidationError("dest.type must be 'us_account' or 'international'")
         urgency = d.get("urgency", "instant")
-        try:
-            self.led.tx(f"payout:{pid}:reserve", [(f"wallet:{wid}", f"payout:{pid}", amount, asset(ccy))], metadata={"type": "payout"})
-        except InsufficientFunds:
-            raise Declined("insufficient funds", "51")
+        if urgency not in ("instant", "standard"):
+            raise ValidationError("urgency must be 'instant' or 'standard'")
+        fp = _fp(wid, amount, ccy, dest, urgency)
         ts = iso(now)
-        self.x("insert into payouts values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", pid, wid, amount, ccy, json.dumps(d["dest"]), urgency,
-               "routing", None, None, None, None, "[]", None, ts, ts)
-        plan = self.route_plan(amount, ccy, d["dest"], urgency, now)
-        attempts, final = [], None
-        if not plan:
-            return self._fail_payout(pid, wid, amount, ccy, "no_route", attempts, now)
-        for k, c in enumerate(plan):
-            bank = self.banks[c["bank"]]
-            fl = f"inflight:{c['bank']}:{ccy}"
-            self.led.tx(f"payout:{pid}:route:{k}", [(f"payout:{pid}", fl, amount, asset(ccy))],
-                        metadata={"type": "payout_route", "bank": c["bank"], "rail": c["rail"]})
+        created = self.x("insert into payouts(id, req_fp, wallet, amount, ccy, dest, urgency, status, attempts, plan, created, updated) "
+                         "values(?,?,?,?,?,?,?,?,?,?,?,?) on conflict do nothing",
+                         pid, fp, wid, amount, ccy, json.dumps(dest), urgency, "new", "[]", None, ts, ts)
+        row = self.q1("select * from payouts where id=?", pid)
+        if row["req_fp"] != fp:
+            raise IdempotencyConflict(f"payout id {pid!r} was already used for a different request")
+        self.audit("payout.request", pid, {"wallet": wid, "amount": amount, "ccy": ccy, "new": bool(created)})
+        self._crash("after_insert")
+        return self._drive(pid, now, duplicate=not created)
+
+    def _claim(self, pid, force=False):
+        now = time.time()
+        if force:
+            self.x("update payouts set lease_until=? where id=?", now + self.lease_s, pid)
+            return True
+        return self.x("update payouts set lease_until=? where id=? and (lease_until is null or lease_until < ?)",
+                      now + self.lease_s, pid, now) == 1
+
+    def _unlease(self, pid):
+        self.x("update payouts set lease_until=null where id=?", pid)
+
+    def _drive(self, pid, now, duplicate=False, force=False):
+        row = self.q1("select * from payouts where id=?", pid)
+        if row["status"] in TERMINAL + ("review", "accepted"):
+            return self._payout_view(row, duplicate)
+        if not self._claim(pid, force):
+            v = self._payout_view(row, duplicate)
+            v["in_progress"] = True       # another worker is driving it; poll GET /payouts/{id}
+            return v
+        try:
+            self._advance(pid, now)
+        except SimulatedCrash:
+            raise                         # a real crash cannot release the lease; it expires on its own
+        except BaseException:
+            self._unlease(pid)
+            raise
+        self._unlease(pid)
+        return self._payout_view(self.q1("select * from payouts where id=?", pid), duplicate)
+
+    def _set(self, pid, now, **kw):
+        kw["updated"] = iso(now)
+        for k in ("attempts", "plan"):
+            if k in kw and not isinstance(kw[k], str) and kw[k] is not None:
+                kw[k] = json.dumps(kw[k])
+        self.x(f"update payouts set {','.join(k + '=?' for k in kw)} where id=?", *kw.values(), pid)
+
+    def _advance(self, pid, now):
+        p = self.q1("select * from payouts where id=?", pid)
+        amount, ccy, wid, a = int(p["amount"]), p["ccy"], p["wallet"], asset(p["ccy"])
+        if p["status"] == "new":
             try:
-                res = bank.submit(c["rail"], {"id": pid, "amount": amount, "ccy": ccy, "dest": d["dest"]}, now)
-            except Rejected as e:
-                self.led.tx(f"payout:{pid}:unroute:{k}", [(fl, f"payout:{pid}", amount, asset(ccy))], metadata={"type": "payout_unroute"})
-                attempts.append({"bank": c["bank"], "rail": c["rail"], "result": "rejected", "reason": e.reason})
-                continue
-            except AdapterError as e:
-                if e.sent is False:   # definitely not sent: safe to fail over
-                    self.led.tx(f"payout:{pid}:unroute:{k}", [(fl, f"payout:{pid}", amount, asset(ccy))], metadata={"type": "payout_unroute"})
-                    attempts.append({"bank": c["bank"], "rail": c["rail"], "result": "unreachable", "reason": str(e)})
+                self.led.tx(f"payout:{pid}:reserve", [(f"wallet:{wid}", f"payout:{pid}", amount, a)], metadata={"type": "payout"})
+            except InsufficientFunds:
+                self._set(pid, now, status="failed", reason="insufficient funds")
+                raise Declined("insufficient funds", "51")
+            self._set(pid, now, status="reserved")
+            self._crash("after_reserve")
+            p = self.q1("select * from payouts where id=?", pid)
+        dest = json.loads(p["dest"])
+        plan = json.loads(p["plan"]) if p["plan"] else None
+        if plan is None:
+            plan = self.route_plan(amount, ccy, dest, p["urgency"], now)
+            self._set(pid, now, plan=plan)
+        attempts = json.loads(p["attempts"] or "[]")
+        if not plan:
+            return self._fail(pid, "no_route", attempts, now)
+        payment = {"id": pid, "amount": amount, "ccy": ccy, "dest": dest}
+        resumed = bool(attempts) and attempts[-1]["result"] == "pending"
+        k = len(attempts) - 1 if resumed else len(attempts)
+        while k < len(plan):
+            c = plan[k]
+            bank, fl = self.banks[c["bank"]], f"inflight:{c['bank']}:{ccy}"
+            if k == len(attempts):           # new attempt: commit liquidity, then write the intent BEFORE calling the bank
+                self.led.tx(f"payout:{pid}:route:{k}", [(f"payout:{pid}", fl, amount, a)],
+                            metadata={"type": "payout_route", "bank": c["bank"], "rail": c["rail"]})
+                attempts.append({"bank": c["bank"], "rail": c["rail"], "result": "pending"})
+                self._set(pid, now, status="routing", bank=c["bank"], rail=c["rail"], attempts=attempts)
+                self._crash("after_route")
+            res, was_resumed = None, resumed
+            if resumed:                      # a previous incarnation may already have sent it: ask the bank first
+                try:
+                    found = bank.lookup(pid)
+                except AdapterError:
+                    return                   # bank unreachable: stay 'routing'; the recovery loop retries (never fail over blindly)
+                if found:
+                    res = {"bank_ref": found["bank_ref"], "status": found["status"], "eta": now}
+                resumed = False
+            if res is None:
+                try:
+                    res = bank.submit(c["rail"], payment, now)      # idempotent on payment id (adapter contract)
+                except Rejected as e:
+                    self.led.tx(f"payout:{pid}:unroute:{k}", [(fl, f"payout:{pid}", amount, a)], metadata={"type": "payout_unroute"})
+                    attempts[k] = {**attempts[k], "result": "rejected", "reason": e.reason}
+                    self._set(pid, now, attempts=attempts)
+                    k += 1
                     continue
-                # outcome unknown: funds stay committed in flight; do NOT try another bank (double-pay risk)
-                attempts.append({"bank": c["bank"], "rail": c["rail"], "result": "unknown", "reason": str(e)})
-                self._update_payout(pid, status="review", bank=c["bank"], rail=c["rail"], attempts=attempts,
-                                    reason="bank outcome unknown; reconcile before retry", now=now)
-                return self._payout_view(self.q1("select * from payouts where id=?", pid))
-            attempts.append({"bank": c["bank"], "rail": c["rail"], "result": res["status"], "bank_ref": res["bank_ref"]})
-            self._update_payout(pid, status=res["status"], bank=c["bank"], rail=c["rail"], bank_ref=res["bank_ref"],
-                                eta=iso(res["eta"]), attempts=attempts, now=now)
+                except AdapterError as e:
+                    if e.sent is False and was_resumed:
+                        return               # a previous run may have sent it: never fail over; recovery retries this bank
+                    if e.sent is False:
+                        self.led.tx(f"payout:{pid}:unroute:{k}", [(fl, f"payout:{pid}", amount, a)], metadata={"type": "payout_unroute"})
+                        attempts[k] = {**attempts[k], "result": "unreachable", "reason": str(e)}
+                        self._set(pid, now, attempts=attempts)
+                        k += 1
+                        continue
+                    attempts[k] = {**attempts[k], "result": "unknown", "reason": str(e)}
+                    self._set(pid, now, status="review", attempts=attempts, reason="bank outcome unknown; resolve by lookup before any retry")
+                    return
+            self._crash("after_submit")
+            attempts[k] = {**attempts[k], "result": res["status"], "bank_ref": res["bank_ref"]}
+            self._set(pid, now, status="accepted" if res["status"] == "accepted" else res["status"], bank=c["bank"], rail=c["rail"],
+                      bank_ref=res["bank_ref"], eta=iso(res["eta"]), attempts=attempts)
             if res["status"] == "settled":
                 self._settle_payout(pid, now)
-            return self._payout_view(self.q1("select * from payouts where id=?", pid))
-        return self._fail_payout(pid, wid, amount, ccy, "all_routes_failed", attempts, now)
+            elif res["status"] == "failed":
+                self._bank_failed(pid, now)
+            return
+        return self._fail(pid, "all_routes_failed", attempts, now)
 
-    def _fail_payout(self, pid, wid, amount, ccy, reason, attempts, now):
-        self.led.tx(f"payout:{pid}:release", [(f"payout:{pid}", f"wallet:{wid}", amount, asset(ccy))], metadata={"type": "payout_release"})
-        self._update_payout(pid, status="failed", attempts=attempts, reason=reason, now=now)
-        return self._payout_view(self.q1("select * from payouts where id=?", pid))
+    def _fail(self, pid, reason, attempts, now):
+        p = self.q1("select * from payouts where id=?", pid)
+        self.led.tx(f"payout:{pid}:release", [(f"payout:{pid}", f"wallet:{p['wallet']}", int(p["amount"]), asset(p["ccy"]))],
+                    metadata={"type": "payout_release"})
+        self._set(pid, now, status="failed", attempts=attempts, reason=reason)
+        self.audit("payout.failed", pid, {"reason": reason})
 
     def _settle_payout(self, pid, now):
         p = self.q1("select * from payouts where id=?", pid)
-        self.led.tx(f"payout:{pid}:settle", [(f"inflight:{p['bank']}:{p['ccy']}", "world", p["amount"], asset(p["ccy"]))],
+        self.led.tx(f"payout:{pid}:settle", [(f"inflight:{p['bank']}:{p['ccy']}", "world", int(p["amount"]), asset(p["ccy"]))],
                     metadata={"type": "payout_settle", "bank": p["bank"], "bank_ref": p["bank_ref"], "rail": p["rail"]})
-        self._update_payout(pid, status="settled", now=now)
+        self._crash("after_settle_tx")
+        self._set(pid, now, status="settled")
+        self.audit("payout.settled", pid, {"bank": p["bank"], "bank_ref": p["bank_ref"], "rail": p["rail"]})
+
+    def _bank_failed(self, pid, now):
+        p = self.q1("select * from payouts where id=?", pid)
+        a = asset(p["ccy"])
+        self.led.tx(f"payout:{pid}:bankfail", [(f"inflight:{p['bank']}:{p['ccy']}", f"wallet:{p['wallet']}", int(p["amount"]), a)],
+                    metadata={"type": "payout_bankfail"})
+        self._set(pid, now, status="failed", reason="bank reported failure")
 
     def poll_payouts(self, now):
-        """Advance deferred payouts (ACH/Fedwire/SWIFT): settle those the bank reports settled, refund those it failed."""
+        """Advance deferred payouts (ACH/Fedwire/SWIFT): settle what the bank reports settled, refund what it failed."""
         done = []
-        for p in self.q("select * from payouts where status='accepted'"):
-            p = dict(p)
-            st = self.banks[p["bank"]].status(p["bank_ref"], now)
+        for r in self.q("select id, bank, bank_ref from payouts where status='accepted'"):
+            try:
+                st = self.banks[r["bank"]].status(r["bank_ref"], now)
+            except AdapterError:
+                continue
             if st == "settled":
-                self._settle_payout(p["id"], now)
+                self._settle_payout(r["id"], now)
             elif st == "failed":
-                fl = f"inflight:{p['bank']}:{p['ccy']}"
-                self.led.tx(f"payout:{p['id']}:bankfail", [(fl, f"wallet:{p['wallet']}", p["amount"], asset(p["ccy"]))])
-                self._update_payout(p["id"], status="failed", reason="bank reported failure", now=now)
-            done.append({"id": p["id"], "status": self.q1("select status from payouts where id=?", p["id"])["status"]})
+                self._bank_failed(r["id"], now)
+            done.append({"id": r["id"], "status": self.q1("select status from payouts where id=?", r["id"])["status"]})
         return done
 
-    def _update_payout(self, pid, now, **kw):
-        kw["updated"] = iso(now)
-        if "attempts" in kw:
-            kw["attempts"] = json.dumps(kw["attempts"])
-        self.x(f"update payouts set {','.join(k + '=?' for k in kw)} where id=?", *kw.values(), pid)
+    def resolve_payout(self, pid, now):
+        """Resolve an unknown-outcome payout by asking the bank. Found -> adopt its state. Definitively absent -> release funds."""
+        p = self.q1("select * from payouts where id=?", pid)
+        if not p:
+            raise NotFound("unknown payout")
+        if p["status"] != "review":
+            return self._payout_view(p)
+        bank = self.banks[p["bank"]]
+        try:
+            found = bank.lookup(pid)
+        except AdapterError:
+            return self._payout_view(p)            # still unknowable; stays in review
+        attempts = json.loads(p["attempts"] or "[]")
+        if found:
+            attempts[-1] = {**attempts[-1], "result": found["status"], "bank_ref": found["bank_ref"]}
+            self._set(pid, now, status="accepted" if found["status"] == "accepted" else found["status"], bank_ref=found["bank_ref"],
+                      attempts=attempts, reason=None)
+            if found["status"] == "settled":
+                self._settle_payout(pid, now)
+            elif found["status"] == "failed":
+                self._bank_failed(pid, now)
+        else:
+            k = len(attempts) - 1
+            a = asset(p["ccy"])
+            self.led.tx(f"payout:{pid}:unroute:{k}", [(f"inflight:{p['bank']}:{p['ccy']}", f"payout:{pid}", int(p["amount"]), a)],
+                        metadata={"type": "payout_unroute"})
+            attempts[k] = {**attempts[k], "result": "not_found_at_bank"}
+            self._fail(pid, "bank has no record of the instruction; funds released", attempts, now)
+        self.audit("payout.resolved", pid, {"found": bool(found)})
+        return self._payout_view(self.q1("select * from payouts where id=?", pid))
+
+    def recover(self, now, stale_s=60, force=False):
+        """Background/ops sweep: resume payouts stuck mid-flight, resolve unknown outcomes, settle deferred ones."""
+        cutoff = iso(now - dt.timedelta(seconds=stale_s))
+        out = {"resumed": [], "resolved": [], "polled": []}
+        for r in self.q("select id from payouts where status in ('new','reserved','routing') and updated <= ?", cutoff):
+            try:
+                v = self._drive(r["id"], now, force=force)
+                out["resumed"].append({"id": r["id"], "status": v["status"]})
+            except Declined:
+                out["resumed"].append({"id": r["id"], "status": "failed"})
+        for r in self.q("select id from payouts where status='review'"):
+            out["resolved"].append({"id": r["id"], "status": self.resolve_payout(r["id"], now)["status"]})
+        out["polled"] = self.poll_payouts(now)
+        return out
 
     def _payout_view(self, p, duplicate=False):
         p = dict(p)
+        for k in ("req_fp", "lease_until", "plan"):
+            p.pop(k, None)
         p["dest"], p["attempts"] = json.loads(p["dest"]), json.loads(p["attempts"] or "[]")
         p["duplicate"] = duplicate
         return p
@@ -316,126 +494,159 @@ class Treasury:
 
     # ------------------------------------------------------------------------------------------- cards
     def card_issue(self, d):
-        self._need(d, "card_id", "wallet")
-        self.x("insert or replace into cards values(?,?,?,?,?,?,?,?)", d["card_id"], d["wallet"], d.get("status", "active"),
-               int(d.get("per_txn_limit", 0)), int(d.get("daily_limit", 0)), json.dumps(d.get("blocked_mcc", [])),
-               json.dumps(d.get("allowed_countries", [])), d.get("credit_id"))
-        return {"card_id": d["card_id"], "status": d.get("status", "active")}
+        cid, wid = self._id(d, "card_id"), self._id(d, "wallet")
+        self.x("insert into cards values(?,?,?,?,?,?,?,?) on conflict(card_id) do update set wallet=excluded.wallet, status=excluded.status, "
+               "per_txn_limit=excluded.per_txn_limit, daily_limit=excluded.daily_limit, blocked_mcc=excluded.blocked_mcc, "
+               "allowed_countries=excluded.allowed_countries, credit_id=excluded.credit_id",
+               cid, wid, d.get("status", "active"), int(d.get("per_txn_limit", 0)), int(d.get("daily_limit", 0)),
+               json.dumps(d.get("blocked_mcc", [])), json.dumps(d.get("allowed_countries", [])), d.get("credit_id"))
+        self.audit("card.issue", cid, {"wallet": wid, "status": d.get("status", "active")})
+        return {"card_id": cid, "status": d.get("status", "active")}
 
     def card_authorize(self, d, now):
-        """Real-time authorization from wallet availability (+ optional credit line). Idempotent per auth_id. Never overspends:
-        the Ledger refuses the hold atomically if funds are short, so concurrent authorizations cannot double-spend."""
+        """Real-time authorization from wallet availability (+ optional credit line). Idempotent per auth_id and bound to the request.
+        Never overspends: the Ledger refuses the hold atomically if funds are short, so concurrent authorizations cannot double-spend."""
         t0 = time.perf_counter()
-        self._need(d, "auth_id", "card_id", "amount", "ccy")
-        prior = self.q1("select * from auths where auth_id=?", d["auth_id"])
+        aid, cid, amount, ccy = self._id(d, "auth_id"), self._id(d, "card_id"), self._amt(d), self._ccy(d)
+        fp = _fp(cid, amount, ccy, d.get("merchant"), d.get("mcc"), d.get("country"))
+        prior = self.q1("select req_fp, response from auths where auth_id=?", aid)
         if prior:
+            if prior["req_fp"] != fp:
+                raise IdempotencyConflict(f"auth_id {aid!r} was already used for a different request")
             r = json.loads(prior["response"])
             r["duplicate"] = True
             return r
-        amount, ccy, aid = int(d["amount"]), d["ccy"], d["auth_id"]
+        hold_ref = f"auth:{aid}:hold"
 
-        def finish(approved, reason, code, held_w=0, held_c=0, credit_id=None, wallet=None):
-            ts = iso(now)
+        def finish(approved, reason, code, held_w=0, held_c=0, credit_id=None, wallet="", persist=True):
             exp = iso(now + dt.timedelta(hours=self.auth_ttl_h))
-            resp = {"auth_id": aid, "approved": approved, "response_code": RESP[code] if code in RESP else code, "reason": reason,
-                    "amount": amount, "ccy": ccy, "latency_ms": round((time.perf_counter() - t0) * 1000, 2), "duplicate": False}
-            self.x("insert or ignore into auths values(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?)", aid, d["card_id"], wallet or "", amount, ccy,
-                   d.get("merchant"), d.get("mcc"), d.get("country"), "authorized" if approved else "declined", held_w, held_c,
-                   credit_id, ts, exp, json.dumps(resp))
+            resp = {"auth_id": aid, "approved": approved, "response_code": RESP.get(code, code), "reason": reason, "amount": amount,
+                    "ccy": ccy, "latency_ms": round((time.perf_counter() - t0) * 1000, 2), "duplicate": False}
+            if persist:
+                self.x("insert into auths(auth_id, req_fp, card_id, wallet, amount, ccy, merchant, mcc, country, status, held_wallet, "
+                       "held_credit, credit_id, captured, released, created, expires, response) "
+                       "values(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?) on conflict do nothing",
+                       aid, fp, cid, wallet, amount, ccy, d.get("merchant"), d.get("mcc"), d.get("country"),
+                       "authorized" if approved else "declined", held_w, held_c, credit_id, iso(now), exp, json.dumps(resp))
             return resp
 
-        card = self.q1("select * from cards where card_id=?", d["card_id"])
+        def adopt_existing_hold(wid, fac):
+            """Crash recovery: a hold from a previous attempt exists in the Ledger but we have no record. The Ledger is the truth."""
+            t = self.led.tx_by_reference(hold_ref)
+            if not t:
+                return None
+            hw = sum(int(p["amount"]) for p in t["postings"] if p["source"].startswith("wallet:"))
+            hc = sum(int(p["amount"]) for p in t["postings"] if p["source"].startswith("credit:"))
+            return finish(True, "approved", "APPROVED", hw, hc, fac["id"] if fac and hc else None, wid)
+
+        card = self.q1("select * from cards where card_id=?", cid)
         if not card:
             return finish(False, "unknown card", "INVALID_CARD")
         wid = card["wallet"]
+        fac = self.q1("select * from facilities where id=? and status='active'", card["credit_id"]) if card["credit_id"] else None
+        decline = None
         if card["status"] != "active":
-            return finish(False, f"card {card['status']}", "DO_NOT_HONOR", wallet=wid)
-        if card["per_txn_limit"] and amount > card["per_txn_limit"]:
-            return finish(False, "exceeds per-transaction limit", "EXCEEDS_LIMIT", wallet=wid)
-        if d.get("mcc") in json.loads(card["blocked_mcc"]):
-            return finish(False, "merchant category blocked", "RESTRICTED", wallet=wid)
-        allowed = json.loads(card["allowed_countries"])
-        if allowed and d.get("country") and d["country"] not in allowed:
-            return finish(False, "country not allowed", "RESTRICTED", wallet=wid)
-        if card["daily_limit"]:
+            decline = (f"card {card['status']}", "DO_NOT_HONOR")
+        elif card["per_txn_limit"] and amount > card["per_txn_limit"]:
+            decline = ("exceeds per-transaction limit", "EXCEEDS_LIMIT")
+        elif d.get("mcc") in json.loads(card["blocked_mcc"]):
+            decline = ("merchant category blocked", "RESTRICTED")
+        elif json.loads(card["allowed_countries"]) and d.get("country") and d["country"] not in json.loads(card["allowed_countries"]):
+            decline = ("country not allowed", "RESTRICTED")
+        elif card["daily_limit"]:
             day = iso(now)[:10]
-            spent = sum(r["amount"] for r in self.q("select amount from auths where card_id=? and status='authorized' and created like ?",
-                                                    d["card_id"], day + "%"))
+            spent = sum(int(r["amount"]) for r in self.q("select amount from auths where card_id=? and status='authorized' and created like ?",
+                                                         cid, day + "%"))
             if spent + amount > card["daily_limit"]:
-                return finish(False, "exceeds daily limit", "EXCEEDS_LIMIT", wallet=wid)
-        fac = None
-        if card["credit_id"]:
-            fac = self.q1("select * from facilities where id=? and status='active'", card["credit_id"])
+                decline = ("exceeds daily limit", "EXCEEDS_LIMIT")
+        if decline:
+            return adopt_existing_hold(wid, fac) or finish(False, decline[0], decline[1], wallet=wid)
         try:
             if fac:
-                r = self.led.tx(f"auth:{aid}:hold", script=NS_ORDERED_DRAW,
+                r = self.led.tx(hold_ref, script=NS_ORDERED_DRAW,
                                 vars={"wallet": f"wallet:{wid}", "credit": f"credit:{fac['id']}", "dst": f"holds:{aid}",
                                       "amt": f"{asset(ccy)} {amount}", "limit": f"{asset(ccy)} {fac['limit_minor']}"},
-                                metadata={"type": "card_hold", "card": d["card_id"]})
+                                metadata={"type": "card_hold", "card": cid})
             else:
-                r = self.led.tx(f"auth:{aid}:hold", [(f"wallet:{wid}", f"holds:{aid}", amount, asset(ccy))],
-                                metadata={"type": "card_hold", "card": d["card_id"]})
+                r = self.led.tx(hold_ref, [(f"wallet:{wid}", f"holds:{aid}", amount, asset(ccy))], metadata={"type": "card_hold", "card": cid})
         except InsufficientFunds:
             return finish(False, "insufficient funds", "INSUFFICIENT_FUNDS", wallet=wid)
+        except IdempotencyConflict:
+            raise
         except LedgerError as e:
-            return finish(False, f"ledger error {e.code}", "SYSTEM_ERROR", wallet=wid)
-        held_w = held_c = 0
-        for p in r["postings"] or []:
-            if p["source"].startswith("wallet:"):
-                held_w += int(p["amount"])
-            elif p["source"].startswith("credit:"):
-                held_c += int(p["amount"])
-        if r["dup"]:   # hold already existed (crash between ledger commit and local record): recover split from the ledger
-            held_w, held_c = amount, 0
-        return finish(True, "approved", "APPROVED", held_w, held_c, fac["id"] if fac else None, wallet=wid)
+            return finish(False, f"ledger unavailable ({e.code})", "SYSTEM_ERROR", wallet=wid, persist=False)   # transient: do not cache
+        self._crash("after_hold")
+        posted = r["postings"]
+        if posted is None:                    # duplicate whose postings the Ledger did not return: read them back (the Ledger is the truth)
+            posted = (self.led.tx_by_reference(hold_ref) or {}).get("postings") or []
+        hw = sum(int(p["amount"]) for p in posted if p["source"].startswith("wallet:"))
+        hc = sum(int(p["amount"]) for p in posted if p["source"].startswith("credit:"))
+        if not posted:
+            raise LedgerError(500, "HOLD_UNREADABLE", f"hold {hold_ref} exists but its postings could not be read")
+        out = finish(True, "approved", "APPROVED", hw, hc, fac["id"] if fac and hc else None, wid)
+        self.audit("card.authorize", aid, {"card": cid, "amount": amount, "approved": True})
+        return out
 
     def _auth(self, aid):
         a = self.q1("select * from auths where auth_id=?", aid)
         if not a:
-            raise KeyError(f"unknown auth {aid}")
+            raise NotFound(f"unknown auth {aid}")
         return a
 
     def card_capture(self, d, now):
-        """Capture up to the held amount. final=true (default) releases any remainder back to its sources (credit line first)."""
-        self._need(d, "auth_id", "amount")
-        a = self._auth(d["auth_id"])
+        """Capture up to the held amount. final=true (default) releases the remainder to its sources (credit line first)."""
+        aid, amt = self._id(d, "auth_id"), self._amt(d)
+        seq = str(d.get("seq", 1))
+        a = self._auth(aid)
+        prior = self.q1("select * from auth_events where auth_id=? and kind='capture' and seq=?", aid, seq)
+        captured, released_tot = self._auth_totals(aid)
+        held = int(a["held_wallet"]) + int(a["held_credit"])
+        if prior:
+            if int(prior["amount"]) != amt:
+                raise IdempotencyConflict(f"capture {aid}/{seq} was already applied with a different amount")
+            return {"auth_id": aid, "captured": amt, "released": int(prior["released"]), "duplicate": True}
         if a["status"] != "authorized":
             raise Declined(f"auth is {a['status']}")
-        ccy, amt, aid = a["ccy"], int(d["amount"]), a["auth_id"]
-        seq = d.get("seq", 1)
-        remaining = a["held_wallet"] + a["held_credit"] - a["captured"] - a["released"]
+        remaining = held - captured - released_tot
         if amt > remaining:
             raise Declined("capture exceeds authorized amount")
-        post = [(f"holds:{aid}", f"card:clearing:{ccy}", amt, asset(ccy))]
-        released = 0
+        ccy, post, released = a["ccy"], [(f"holds:{aid}", f"card:clearing:{a['ccy']}", amt, asset(a["ccy"]))], 0
         if d.get("final", True) and remaining - amt > 0:
             rest = remaining - amt
             released = rest
-            back_c = min(rest, a["held_credit"])
+            back_c = min(rest, int(a["held_credit"]))
             if back_c:
                 post.append((f"holds:{aid}", f"credit:{a['credit_id']}", back_c, asset(ccy)))
             if rest - back_c:
                 post.append((f"holds:{aid}", f"wallet:{a['wallet']}", rest - back_c, asset(ccy)))
         r = self.led.tx(f"auth:{aid}:capture:{seq}", post, metadata={"type": "card_capture"})
-        if not r["dup"]:
-            self.x("update auths set captured=captured+?, released=released+?, status=? where auth_id=?", amt, released,
-                   "captured" if d.get("final", True) else "authorized", aid)
+        self._crash("after_capture_tx")
+        self.x("insert into auth_events values(?,?,?,?,?) on conflict do nothing", aid, "capture", seq, amt, released)
+        if d.get("final", True):
+            self.x("update auths set status='captured' where auth_id=?", aid)
+        self.audit("card.capture", aid, {"amount": amt, "released": released})
         return {"auth_id": aid, "captured": amt, "released": released, "ledger_tx": r["id"], "duplicate": r["dup"]}
 
     def card_reverse(self, d, now):
-        a = self._auth(d["auth_id"])
+        aid = self._id(d, "auth_id")
+        a = self._auth(aid)
+        if a["status"] == "reversed":
+            return {"auth_id": aid, "status": "reversed", "released": self._auth_totals(aid)[1], "duplicate": True}
         if a["status"] != "authorized":
-            return {"auth_id": a["auth_id"], "status": a["status"], "released": 0}
-        aid, ccy = a["auth_id"], a["ccy"]
-        remaining = a["held_wallet"] + a["held_credit"] - a["captured"] - a["released"]
-        post, back_c = [], min(remaining, a["held_credit"])
+            return {"auth_id": aid, "status": a["status"], "released": 0}
+        ccy = a["ccy"]
+        captured, released_tot = self._auth_totals(aid)
+        remaining = int(a["held_wallet"]) + int(a["held_credit"]) - captured - released_tot
+        post, back_c = [], min(remaining, int(a["held_credit"]))
         if back_c:
             post.append((f"holds:{aid}", f"credit:{a['credit_id']}", back_c, asset(ccy)))
         if remaining - back_c:
             post.append((f"holds:{aid}", f"wallet:{a['wallet']}", remaining - back_c, asset(ccy)))
         if post:
             self.led.tx(f"auth:{aid}:reverse", post, metadata={"type": "card_reverse"})
-        self.x("update auths set released=released+?, status='reversed' where auth_id=?", remaining, aid)
+        self.x("insert into auth_events values(?,?,?,?,?) on conflict do nothing", aid, "reverse", "1", 0, remaining)
+        self.x("update auths set status='reversed' where auth_id=?", aid)
+        self.audit("card.reverse", aid, {"released": remaining})
         return {"auth_id": aid, "status": "reversed", "released": remaining}
 
     def card_expire(self, now):
@@ -471,7 +682,7 @@ class Treasury:
         self._need(d, "quote_id")
         qt = self.q1("select * from quotes where id=?", d["quote_id"])
         if not qt:
-            raise KeyError("unknown quote")
+            raise NotFound("unknown quote")
         if qt["status"] == "used":
             return {"status": "converted", "duplicate": True, "buy": qt["buy"]}
         if iso(now) > qt["expires"]:
@@ -539,14 +750,14 @@ class Treasury:
     # ------------------------------------------------------------------------------------------- credit
     def credit_open(self, d, now):
         self._need(d, "facility_id", "borrower", "ccy", "limit")
-        self.x("insert or ignore into facilities values(?,?,?,?,?,?,?)", d["facility_id"], d["borrower"], d["ccy"], int(d["limit"]),
+        self.x("insert into facilities values(?,?,?,?,?,?,?) on conflict do nothing", d["facility_id"], d["borrower"], d["ccy"], int(d["limit"]),
                int(d.get("apr_bps", 0)), "active", iso(now)[:10])
         return {"facility_id": d["facility_id"], "limit": int(d["limit"]), "status": "active"}
 
     def _fac(self, fid):
         f = self.q1("select * from facilities where id=?", fid)
         if not f:
-            raise KeyError(f"unknown facility {fid}")
+            raise NotFound(f"unknown facility {fid}")
         return f
 
     def credit_status(self, fid):
@@ -609,7 +820,7 @@ class Treasury:
         self.led.tx(f"guarantee:{gid}:memo", script=NS_MEMO,
                     vars={"issued": f"memo:guarantees:issued:{d['ccy']}", "memo": f"memo:guarantee:{gid}", "amt": f"{a} {amt}"},
                     metadata={"type": "guarantee_memo"})
-        self.x("insert or ignore into guarantees values(?,?,?,?,?,?,0,?,?)", gid, d["applicant"], d["beneficiary"], d["ccy"], amt,
+        self.x("insert into guarantees values(?,?,?,?,?,?,0,?,?) on conflict do nothing", gid, d["applicant"], d["beneficiary"], d["ccy"], amt,
                collateral, "active", d.get("expiry"))
         return {"guarantee_id": gid, "amount": amt, "collateral_held": collateral, "status": "active"}
 
@@ -645,6 +856,7 @@ class Treasury:
     # ------------------------------------------------------------------------------------------- inbound & reconciliation
     def apply_inbound(self, bank, e):
         """Post a bank credit to the Ledger (idempotent on bank_ref). Attributable via narrative 'WALLET:<id>', else suspense."""
+        self._need(e, "bank_ref", "ccy", "amount", "narrative")
         a = asset(e["ccy"])
         wid = e["narrative"].split("WALLET:")[1].split()[0] if "WALLET:" in e["narrative"] else None
         dest = f"wallet:{wid}" if wid else f"unapplied:{bank}:{e['ccy']}"
@@ -680,7 +892,7 @@ class Treasury:
         for kind in ("unmatched_bank_debits", "amount_mismatch", "ledger_settled_not_on_statement", "credits_unapplied"):
             for it in rep[kind]:
                 ref = it.get("bank_ref") or it.get("payout")
-                self.x("insert or replace into recon values(?,?,?,?,?)", bank_name, ref, kind, "open", json.dumps(it))
+                self.x("insert into recon values(?,?,?,?,?) on conflict(bank, bank_ref) do update set kind=excluded.kind, status=excluded.status, detail=excluded.detail", bank_name, ref, kind, "open", json.dumps(it))
         rep["clean"] = not (rep["unmatched_bank_debits"] or rep["amount_mismatch"] or rep["ledger_settled_not_on_statement"])
         rep["ledger_inflight"] = {c: self.led.balance(f"inflight:{bank_name}:{c}", asset(c)) for c in ("USD", "EUR", "GBP")
                                   if c in bank.ccys}

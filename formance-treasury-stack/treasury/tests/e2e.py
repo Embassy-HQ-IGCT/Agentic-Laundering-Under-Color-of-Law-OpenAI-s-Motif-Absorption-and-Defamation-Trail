@@ -2,14 +2,17 @@
 """End-to-end test of the treasury engine against a live engine + Ledger (server started with TREASURY_TEST_CLOCK=1 TREASURY_ADMIN=1).
 Usage: e2e.py [base_url] [rafiki_webhooks.jsonl]"""
 import concurrent.futures as cf
-import http.client
 import json
 import os
 import sys
 import time
 import uuid
 
-BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8200").replace("http://", "")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import client
+from client import call as _call
+
+client.configure(sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:8200")
 RAFIKI_LOG = sys.argv[2] if len(sys.argv) > 2 else ""
 R = uuid.uuid4().hex[:6]            # run id: keeps ids unique across runs
 
@@ -20,23 +23,8 @@ FRI_20 = "2026-10-16T20:00:00-04:00"       # Friday after Fedwire close
 SUN_22 = "2026-10-18T22:00:00-04:00"       # Sunday, Fedwire has reopened
 MON_11 = "2026-10-19T11:00:00-04:00"
 
-_tl = __import__("threading").local()
-
-
-def call(method, path, body=None, now=None):
-    c = getattr(_tl, "c", None)
-    if c is None:
-        c = http.client.HTTPConnection(BASE, timeout=30)
-        c.connect()
-        c.sock.setsockopt(__import__("socket").IPPROTO_TCP, __import__("socket").TCP_NODELAY, 1)
-        _tl.c = c
-    h = {"Content-Type": "application/json"}
-    if now:
-        h["X-Now"] = now
-    c.request(method, path, json.dumps(body) if body is not None else None, h)
-    r = c.getresponse()
-    raw = r.read()
-    return r.status, (json.loads(raw) if raw else {})
+def call(method, path, body=None, now=None, **kw):
+    return _call(method, path, body, now=now, **kw)
 
 
 P, F = 0, 0
@@ -103,8 +91,12 @@ s, p = call("POST", "/payouts", {"id": f"{R}-p1", "wallet": acme, "amount": 150_
                                  "dest": {"type": "us_account", "routing": "021000021", "account": "000123456"}}, now=SAT_3AM)
 ok("Sat 03:00 payout goes out instantly on FedNow", s == 200 and p["status"] == "settled" and p["rail"] == "FEDNOW", (s, p))
 eq("wallet debited exactly once", wal(acme)["balance"], before - 150_000)
-s, p2 = call("POST", "/payouts", {"id": f"{R}-p1", "wallet": acme, "amount": 150_000, "ccy": "USD", "dest": {}}, now=SAT_3AM)
+s, p2 = call("POST", "/payouts", {"id": f"{R}-p1", "wallet": acme, "amount": 150_000, "ccy": "USD",
+                                  "dest": {"type": "us_account", "routing": "021000021", "account": "000123456"}}, now=SAT_3AM)
 ok("payout retry returns same payout, no second debit", p2["duplicate"] and wal(acme)["balance"] == before - 150_000, p2)
+s, pc = call("POST", "/payouts", {"id": f"{R}-p1", "wallet": acme, "amount": 999, "ccy": "USD",
+                                  "dest": {"type": "us_account", "routing": "021000021", "account": "000123456"}}, now=SAT_3AM)
+ok("same payout id with a DIFFERENT amount is refused (409), not silently accepted", s == 409, (s, pc))
 
 call("POST", "/admin/bank/bofa/control", {"down": True})
 s, p = call("POST", "/payouts", {"id": f"{R}-p2", "wallet": acme, "amount": 100_000, "ccy": "USD",
@@ -119,10 +111,21 @@ call("POST", "/admin/bank/bofa/control", {"refuse_connect": False, "timeout_afte
 bw = wal(acme)["balance"]
 s, p = call("POST", "/payouts", {"id": f"{R}-p2c", "wallet": acme, "amount": 100_000, "ccy": "USD",
                                  "dest": {"type": "us_account", "routing": "021000021", "account": "000123456"}}, now=SAT_3AM)
-ok("timeout AFTER send (outcome unknown) -> parked for review, NOT retried elsewhere (no double-pay)",
+ok("reply lost AFTER the bank accepted (outcome unknown) -> parked for review, NOT retried elsewhere (no double-pay)",
    p["status"] == "review" and len(p["attempts"]) == 1 and p["attempts"][0]["result"] == "unknown", p)
 eq("funds stay committed while the outcome is unknown", wal(acme)["balance"], bw - 100_000)
 call("POST", "/admin/bank/bofa/control", {"timeout_after_send": False})
+p = call("POST", f"/payouts/{R}-p2c/resolve", {}, now=SAT_3AM)[1]
+ok("resolve asks the bank by payout id, finds the instruction and adopts its state", p["status"] == "settled" and p["bank"] == "bofa", p)
+subs = call("GET", "/admin/bank/bofa/submissions")[1]; subs2 = call("GET", "/admin/bank/nfcu/submissions")[1]
+ok("exactly one instruction ever existed at the bank, none at the other bank", subs.get(f"{R}-p2c") == 1 and f"{R}-p2c" not in subs2, (subs, subs2))
+call("POST", "/admin/bank/bofa/control", {"timeout_before_send": True})
+bw = wal(acme)["balance"]
+s, p = call("POST", "/payouts", {"id": f"{R}-p2d", "wallet": acme, "amount": 100_000, "ccy": "USD",
+                                 "dest": {"type": "us_account", "routing": "021000021", "account": "000123456"}}, now=SAT_3AM)
+call("POST", "/admin/bank/bofa/control", {"timeout_before_send": False})
+p = call("POST", f"/payouts/{R}-p2d/resolve", {}, now=SAT_3AM)[1]
+ok("request lost before the bank saw it -> resolve finds nothing and releases the funds", p["status"] == "failed" and wal(acme)["balance"] == bw, p)
 call("POST", "/admin/bank/nfcu/control", {"down": True}); call("POST", "/admin/bank/bofa/control", {"down": True})
 b4 = wal(acme)["balance"]
 s, p = call("POST", "/payouts", {"id": f"{R}-p3", "wallet": acme, "amount": 100_000, "ccy": "USD",
@@ -155,7 +158,7 @@ ok("standard-urgency business-hours payout uses cheapest rail (ACH)", p["rail"] 
 call("POST", "/payouts/poll", {}, now=WED_14)
 eq("ACH settles after same-day window", call("GET", f"/payouts/{R}-p6")[1]["status"], "settled")
 
-s, p = call("POST", "/payouts", {"id": f"{R}-p7", "wallet": bob, "amount": 999_999_999, "ccy": "USD", "dest": {"type": "us_account"}}, now=WED_11)
+s, p = call("POST", "/payouts", {"id": f"{R}-p7", "wallet": bob, "amount": 999_999_999, "ccy": "USD", "dest": {"type": "us_account", "routing": "021000021", "account": "1"}}, now=WED_11)
 ok("payout beyond wallet funds declined, nothing sent", s == 422, (s, p))
 
 print("== FX conversion and international payout")
@@ -196,8 +199,12 @@ ok("replayed authorization returns the same decision, no second hold", a1b["dupl
 s, cap = call("POST", "/card/capture", {"auth_id": f"{R}-a1", "amount": 60_000}, now=SAT_3AM)
 ok("capture 60.00 of 100.00 releases the remainder", s == 200 and cap["captured"] == 60_000 and cap["released"] == 40_000, cap)
 eq("wallet restored for the released part", wal(bob)["balance"], 190_000)
-s, cap2 = call("POST", "/card/capture", {"auth_id": f"{R}-a1", "amount": 10}, now=SAT_3AM)
-ok("capturing a closed authorization refused", s == 422, (s, cap2))
+s, cap2 = call("POST", "/card/capture", {"auth_id": f"{R}-a1", "amount": 10, "seq": 2}, now=SAT_3AM)
+ok("a NEW capture against a closed authorization refused (422)", s == 422, (s, cap2))
+s, cap3 = call("POST", "/card/capture", {"auth_id": f"{R}-a1", "amount": 10}, now=SAT_3AM)
+ok("re-sending capture #1 with a different amount is an idempotency conflict (409)", s == 409, (s, cap3))
+s, cap4 = call("POST", "/card/capture", {"auth_id": f"{R}-a1", "amount": 60_000}, now=SAT_3AM)
+ok("re-sending the identical capture is a harmless duplicate", s == 200 and cap4["duplicate"] and wal(bob)["balance"] == 190_000, (s, cap4))
 a6 = A(6, 90_000); rv = call("POST", "/card/reverse", {"auth_id": f"{R}-a6"}, now=SAT_3AM)[1]
 ok("reversal releases the full hold", rv["released"] == 90_000 and wal(bob)["balance"] == 190_000, rv)
 a7 = A(7, 40_000)
@@ -306,9 +313,9 @@ if RAFIKI_LOG and os.path.exists(RAFIKI_LOG):
         base_s, base_r = wal(sender)["balance"], wal(recv)["balance"]
         base_set = call("GET", "/admin/balance/rafiki:settlement")[1]["balance"]
         for e in evs:
-            call("POST", "/rafiki/webhooks", e)
+            call("POST", "/rafiki/webhooks", e, rafiki=True)
         for e in evs:                                   # Rafiki retries: must be harmless
-            call("POST", "/rafiki/webhooks", e)
+            call("POST", "/rafiki/webhooks", e, rafiki=True)
         eq("sender debited 15.00 once", wal(sender)["balance"], base_s - 1_500)
         eq("receiver credited 15.00 once", wal(recv)["balance"], base_r + 1_500)
         eq("Interledger settlement account nets to zero for an on-ledger payment", call("GET", "/admin/balance/rafiki:settlement")[1]["balance"], base_set)

@@ -57,7 +57,7 @@ variable "deletion_protection" {
 variable "databases" {
   type        = list(string)
   description = "Logical Postgres databases (each gets its own user and Secret Manager password)"
-  default     = ["rafiki_backend", "rafiki_auth", "payments", "temporal", "temporal_visibility", "hyperswitch"]
+  default     = ["rafiki_backend", "rafiki_auth", "payments", "temporal", "temporal_visibility", "treasury"]
 }
 variable "bank_secret_names" {
   type        = list(string)
