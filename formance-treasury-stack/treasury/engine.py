@@ -21,6 +21,7 @@ Chart of accounts (all amounts integer minor units, asset "<CCY>/2"):
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -30,6 +31,22 @@ import rails as railmod
 from banks import AdapterError, Rejected
 from ledger import IdempotencyConflict, InsufficientFunds, LedgerError
 from store import Store
+
+# Wallet account naming. Default `wallet:<id>`. Point the engine at an existing ledger layout with
+#   WALLET_ACCOUNT_PREFIX=liquidity:wallet:                      -> wallet "corpus-reflection" is account liquidity:wallet:corpus-reflection
+#   WALLET_ALIASES_JSON={"corpus-6b":"treasury:available:corpus-6b"}   -> wallet id mapped to an arbitrary account (cards can hold against it)
+# Card pre-authorization, payouts, transfers, FX, credit and guarantees all resolve wallets through W().
+WALLET_PREFIX = os.environ.get("WALLET_ACCOUNT_PREFIX", "wallet:")
+WALLET_ALIASES = json.loads(os.environ.get("WALLET_ALIASES_JSON", "{}") or "{}")
+
+
+def W(wid):
+    return WALLET_ALIASES.get(wid) or WALLET_PREFIX + wid
+
+
+def is_wallet(addr):
+    return addr.startswith(WALLET_PREFIX) or addr in WALLET_ALIASES.values()
+
 
 RESP = {"APPROVED": "00", "DO_NOT_HONOR": "05", "INSUFFICIENT_FUNDS": "51", "EXCEEDS_LIMIT": "61", "RESTRICTED": "62",
         "INVALID_CARD": "14", "SYSTEM_ERROR": "96"}
@@ -217,7 +234,7 @@ class Treasury:
 
     def wallet(self, wid, ccy="USD"):
         a = asset(ccy)
-        bal = self.led.balance(f"wallet:{wid}", a)
+        bal = self.led.balance(W(wid), a)
         held = 0
         for r in self.q("select a.held_wallet hw, a.held_credit hc, coalesce(sum(e.amount),0) c, coalesce(sum(e.released),0) r "
                         "from auths a left join auth_events e on e.auth_id=a.auth_id "
@@ -233,7 +250,7 @@ class Treasury:
     def transfer(self, d):
         ref, src, dst, amt, ccy = self._id(d, "ref"), self._id(d, "from"), self._id(d, "to"), self._amt(d), self._ccy(d)
         try:
-            r = self.led.tx(f"transfer:{ref}", [(f"wallet:{src}", f"wallet:{dst}", amt, asset(ccy))], metadata={"type": "transfer"})
+            r = self.led.tx(f"transfer:{ref}", [(W(src), W(dst), amt, asset(ccy))], metadata={"type": "transfer"})
         except InsufficientFunds:
             raise Declined("insufficient funds", "51")
         self.audit("transfer", ref, {"from": src, "to": dst, "amount": amt, "ccy": ccy})
@@ -333,7 +350,7 @@ class Treasury:
         amount, ccy, wid, a = int(p["amount"]), p["ccy"], p["wallet"], asset(p["ccy"])
         if p["status"] == "new":
             try:
-                self.led.tx(f"payout:{pid}:reserve", [(f"wallet:{wid}", f"payout:{pid}", amount, a)], metadata={"type": "payout"})
+                self.led.tx(f"payout:{pid}:reserve", [(W(wid), f"payout:{pid}", amount, a)], metadata={"type": "payout"})
             except InsufficientFunds:
                 self._set(pid, now, status="failed", reason="insufficient funds")
                 raise Declined("insufficient funds", "51")
@@ -403,7 +420,7 @@ class Treasury:
 
     def _fail(self, pid, reason, attempts, now):
         p = self.q1("select * from payouts where id=?", pid)
-        self.led.tx(f"payout:{pid}:release", [(f"payout:{pid}", f"wallet:{p['wallet']}", int(p["amount"]), asset(p["ccy"]))],
+        self.led.tx(f"payout:{pid}:release", [(f"payout:{pid}", W(p['wallet']), int(p["amount"]), asset(p["ccy"]))],
                     metadata={"type": "payout_release"})
         self._set(pid, now, status="failed", attempts=attempts, reason=reason)
         self.audit("payout.failed", pid, {"reason": reason})
@@ -419,7 +436,7 @@ class Treasury:
     def _bank_failed(self, pid, now):
         p = self.q1("select * from payouts where id=?", pid)
         a = asset(p["ccy"])
-        self.led.tx(f"payout:{pid}:bankfail", [(f"inflight:{p['bank']}:{p['ccy']}", f"wallet:{p['wallet']}", int(p["amount"]), a)],
+        self.led.tx(f"payout:{pid}:bankfail", [(f"inflight:{p['bank']}:{p['ccy']}", W(p['wallet']), int(p["amount"]), a)],
                     metadata={"type": "payout_bankfail"})
         self._set(pid, now, status="failed", reason="bank reported failure")
 
@@ -539,7 +556,7 @@ class Treasury:
             t = self.led.tx_by_reference(hold_ref)
             if not t:
                 return None
-            hw = sum(int(p["amount"]) for p in t["postings"] if p["source"].startswith("wallet:"))
+            hw = sum(int(p["amount"]) for p in t["postings"] if is_wallet(p["source"]))
             hc = sum(int(p["amount"]) for p in t["postings"] if p["source"].startswith("credit:"))
             return finish(True, "approved", "APPROVED", hw, hc, fac["id"] if fac and hc else None, wid)
 
@@ -568,11 +585,11 @@ class Treasury:
         try:
             if fac:
                 r = self.led.tx(hold_ref, script=NS_ORDERED_DRAW,
-                                vars={"wallet": f"wallet:{wid}", "credit": f"credit:{fac['id']}", "dst": f"holds:{aid}",
+                                vars={"wallet": W(wid), "credit": f"credit:{fac['id']}", "dst": f"holds:{aid}",
                                       "amt": f"{asset(ccy)} {amount}", "limit": f"{asset(ccy)} {fac['limit_minor']}"},
                                 metadata={"type": "card_hold", "card": cid})
             else:
-                r = self.led.tx(hold_ref, [(f"wallet:{wid}", f"holds:{aid}", amount, asset(ccy))], metadata={"type": "card_hold", "card": cid})
+                r = self.led.tx(hold_ref, [(W(wid), f"holds:{aid}", amount, asset(ccy))], metadata={"type": "card_hold", "card": cid})
         except InsufficientFunds:
             return finish(False, "insufficient funds", "INSUFFICIENT_FUNDS", wallet=wid)
         except IdempotencyConflict:
@@ -583,7 +600,7 @@ class Treasury:
         posted = r["postings"]
         if posted is None:                    # duplicate whose postings the Ledger did not return: read them back (the Ledger is the truth)
             posted = (self.led.tx_by_reference(hold_ref) or {}).get("postings") or []
-        hw = sum(int(p["amount"]) for p in posted if p["source"].startswith("wallet:"))
+        hw = sum(int(p["amount"]) for p in posted if is_wallet(p["source"]))
         hc = sum(int(p["amount"]) for p in posted if p["source"].startswith("credit:"))
         if not posted:
             raise LedgerError(500, "HOLD_UNREADABLE", f"hold {hold_ref} exists but its postings could not be read")
@@ -622,7 +639,7 @@ class Treasury:
             if back_c:
                 post.append((f"holds:{aid}", f"credit:{a['credit_id']}", back_c, asset(ccy)))
             if rest - back_c:
-                post.append((f"holds:{aid}", f"wallet:{a['wallet']}", rest - back_c, asset(ccy)))
+                post.append((f"holds:{aid}", W(a['wallet']), rest - back_c, asset(ccy)))
         r = self.led.tx(f"auth:{aid}:capture:{seq}", post, metadata={"type": "card_capture"})
         self._crash("after_capture_tx")
         self.x("insert into auth_events values(?,?,?,?,?) on conflict do nothing", aid, "capture", seq, amt, released)
@@ -645,7 +662,7 @@ class Treasury:
         if back_c:
             post.append((f"holds:{aid}", f"credit:{a['credit_id']}", back_c, asset(ccy)))
         if remaining - back_c:
-            post.append((f"holds:{aid}", f"wallet:{a['wallet']}", remaining - back_c, asset(ccy)))
+            post.append((f"holds:{aid}", W(a['wallet']), remaining - back_c, asset(ccy)))
         if post:
             self.led.tx(f"auth:{aid}:reverse", post, metadata={"type": "card_reverse"})
         self.x("insert into auth_events values(?,?,?,?,?) on conflict do nothing", aid, "reverse", "1", 0, remaining)
@@ -692,8 +709,8 @@ class Treasury:
         if iso(now) > qt["expires"]:
             raise Declined("quote expired")
         try:
-            r = self.led.tx(f"fx:{qt['id']}", [(f"wallet:{qt['wallet']}", f"fx:pool:{qt['sell_ccy']}", qt["sell"], asset(qt["sell_ccy"])),
-                                              (f"fx:pool:{qt['buy_ccy']}", f"wallet:{qt['wallet']}", qt["buy"], asset(qt["buy_ccy"]))],
+            r = self.led.tx(f"fx:{qt['id']}", [(W(qt['wallet']), f"fx:pool:{qt['sell_ccy']}", qt["sell"], asset(qt["sell_ccy"])),
+                                              (f"fx:pool:{qt['buy_ccy']}", W(qt['wallet']), qt["buy"], asset(qt["buy_ccy"]))],
                             metadata={"type": "fx", "rate": qt["rate"]})
         except InsufficientFunds:
             raise Declined("insufficient funds or no FX inventory in the target currency")
@@ -776,7 +793,7 @@ class Treasury:
         a = asset(f["ccy"])
         try:
             r = self.led.tx(f"credit:{f['id']}:draw:{d['ref']}", script=NS_CREDIT_DRAW,
-                            vars={"credit": f"credit:{f['id']}", "wallet": f"wallet:{f['borrower']}", "amt": f"{a} {int(d['amount'])}",
+                            vars={"credit": f"credit:{f['id']}", "wallet": W(f['borrower']), "amt": f"{a} {int(d['amount'])}",
                                   "limit": f"{a} {f['limit_minor']}"}, metadata={"type": "credit_draw"})
         except InsufficientFunds:
             raise Declined("exceeds available credit")
@@ -790,7 +807,7 @@ class Treasury:
         if amt <= 0:
             return dict(self.credit_status(f["id"]), repaid=0)
         try:
-            r = self.led.tx(f"credit:{f['id']}:repay:{d['ref']}", [(f"wallet:{f['borrower']}", f"credit:{f['id']}", amt, asset(f["ccy"]))],
+            r = self.led.tx(f"credit:{f['id']}:repay:{d['ref']}", [(W(f['borrower']), f"credit:{f['id']}", amt, asset(f["ccy"]))],
                             metadata={"type": "credit_repay"})
         except InsufficientFunds:
             raise Declined("insufficient funds in borrower wallet")
@@ -817,7 +834,7 @@ class Treasury:
         collateral = int(amt * float(d.get("collateral_pct", 100)) / 100)
         if collateral:
             try:
-                self.led.tx(f"guarantee:{gid}:collateral", [(f"wallet:{d['applicant']}", f"collateral:{gid}", collateral, a)],
+                self.led.tx(f"guarantee:{gid}:collateral", [(W(d['applicant']), f"collateral:{gid}", collateral, a)],
                             metadata={"type": "guarantee_collateral"})
             except InsufficientFunds:
                 raise Declined("insufficient funds for collateral")
@@ -838,8 +855,8 @@ class Treasury:
             raise Declined("claim exceeds guaranteed amount")
         a, gid = asset(g["ccy"]), g["id"]
         r = self.led.tx(f"guarantee:{gid}:claim:{d['ref']}", script=NS_GUARANTEE_CLAIM,
-                        vars={"collateral": f"collateral:{gid}", "applicant": f"wallet:{g['applicant']}",
-                              "receivable": f"receivable:guarantee:{gid}", "beneficiary": f"wallet:{g['beneficiary']}", "amt": f"{a} {amt}"},
+                        vars={"collateral": f"collateral:{gid}", "applicant": W(g['applicant']),
+                              "receivable": f"receivable:guarantee:{gid}", "beneficiary": W(g['beneficiary']), "amt": f"{a} {amt}"},
                         metadata={"type": "guarantee_claim"})
         if not r["dup"]:
             self.x("update guarantees set claimed=claimed+? where id=?", amt, gid)
@@ -853,7 +870,7 @@ class Treasury:
         a, gid = asset(g["ccy"]), g["id"]
         left = self.led.balance(f"collateral:{gid}", a)
         if left > 0:
-            self.led.tx(f"guarantee:{gid}:release", [(f"collateral:{gid}", f"wallet:{g['applicant']}", left, a)])
+            self.led.tx(f"guarantee:{gid}:release", [(f"collateral:{gid}", W(g['applicant']), left, a)])
         self.x("update guarantees set status='released' where id=?", gid)
         return {"guarantee_id": gid, "collateral_returned": left, "status": "released"}
 
@@ -899,7 +916,7 @@ class Treasury:
         self._need(e, "bank_ref", "ccy", "amount", "narrative")
         a = asset(e["ccy"])
         wid = e["narrative"].split("WALLET:")[1].split()[0] if "WALLET:" in e["narrative"] else None
-        dest = f"wallet:{wid}" if wid else f"unapplied:{bank}:{e['ccy']}"
+        dest = W(wid) if wid else f"unapplied:{bank}:{e['ccy']}"
         r = self.led.tx(f"inbound:{bank}:{e['bank_ref']}", [("world", dest, int(e["amount"]), a)],
                         metadata={"type": "inbound", "bank_ref": e["bank_ref"], "rail": e.get("rail", "")})
         return {"bank_ref": e["bank_ref"], "to": dest, "duplicate": r["dup"]}
@@ -946,13 +963,13 @@ class Treasury:
         def amt(k):
             return int(dta[k]["value"]), f"{dta[k]['assetCode']}/{dta[k]['assetScale']}"
         if t == "outgoing_payment.created":
-            v, a = amt("debitAmount"); post = [(f"wallet:{wa}", f"rafiki:inflight:{pid}", v, a)]
+            v, a = amt("debitAmount"); post = [(W(wa), f"rafiki:inflight:{pid}", v, a)]
         elif t == "outgoing_payment.completed":
             v, a = amt("sentAmount"); post = [(f"rafiki:inflight:{pid}", "rafiki:settlement", v, a)]
         elif t == "outgoing_payment.failed":
-            v, a = amt("debitAmount"); post = [(f"rafiki:inflight:{pid}", f"wallet:{wa}", v, a)]
+            v, a = amt("debitAmount"); post = [(f"rafiki:inflight:{pid}", W(wa), v, a)]
         elif t == "incoming_payment.completed":
-            v, a = amt("receivedAmount"); post = [("rafiki:settlement", f"wallet:{wa}", v, a)]
+            v, a = amt("receivedAmount"); post = [("rafiki:settlement", W(wa), v, a)]
         else:
             return {"ignored": t}
         try:

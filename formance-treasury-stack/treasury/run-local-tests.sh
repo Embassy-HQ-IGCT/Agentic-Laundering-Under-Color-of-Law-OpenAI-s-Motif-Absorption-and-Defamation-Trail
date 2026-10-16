@@ -76,6 +76,23 @@ for _ in $(seq 60); do curl -fs localhost:18210/livez >/dev/null 2>&1 && break; 
 python3 "$HERE/tests/manual_flow.py" 127.0.0.1:18210 || RC=1
 kill -TERM $MP 2>/dev/null; wait $MP 2>/dev/null
 
+echo "################ cards, transfers and holds on an existing ledger layout (treasury balance account + liquidity wallets)"
+CP=""
+curl -fsS -X POST "localhost:19000/v3/corpusflow" -H 'content-type: application/json' -d '{}' >/dev/null
+"$LEDGERCTL" --server localhost:18888 indexes create --ledger corpusflow --type reference >/dev/null
+for _ in $(seq 60); do
+  curl -fs -G "localhost:19000/v3/corpusflow/transactions" --data-urlencode 'pageSize=1' --data-urlencode 'filter={"$match":{"reference":"probe"}}' >/dev/null 2>&1 && break
+  sleep 0.5
+done
+env PYTHONDONTWRITEBYTECODE=1 HOME=/nonexistent TREASURY_ENV=test TREASURY_ALLOW_MOCK_BANKS=1 TREASURY_BG=0 TREASURY_API_KEYS="$KEYS" RAFIKI_WEBHOOK_SECRET="$RAFIKI_SECRET" \
+    LEDGER_URL=http://127.0.0.1:19000 LEDGER_NAME=corpusflow PORT=18220 METRICS_PORT=19120 \
+    WALLET_ACCOUNT_PREFIX=liquidity:wallet: WALLET_ALIASES_JSON='{"corpus-6b":"treasury:available:corpus-6b"}' \
+    DATABASE_URL="${PG_URL:-sqlite:///$W/corpus.db}" python3 -I "$SRC/server.py" > "$W/engine-corpus.log" 2>&1 &
+CP=$!
+for _ in $(seq 60); do curl -fs localhost:18220/livez >/dev/null 2>&1 && break; sleep 0.25; done
+python3 "$HERE/tests/corpus_cards.py" 127.0.0.1:18220 || RC=1
+kill -TERM $CP 2>/dev/null; wait $CP 2>/dev/null
+
 echo "################ graceful shutdown"
 kill -TERM $EP
 for _ in $(seq 40); do kill -0 $EP 2>/dev/null || break; sleep 0.25; done
