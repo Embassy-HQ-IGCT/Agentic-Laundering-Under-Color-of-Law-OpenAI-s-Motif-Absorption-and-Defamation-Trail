@@ -3,7 +3,7 @@
 Open-source (Apache-2.0), ledger-first treasury, payments and card-authorization engine built on **Formance** (Ledger v3 over its HTTP API), with **Rafiki** (Interledger / Open Payments) in front and bank rails behind. Built to run on **GKE**.
 
 > **Status: hardened and sandbox-verified; not yet production-approved.** The engine has crash-safe money flows, request-bound idempotency,
-> signed-request auth with scopes, Postgres state, observability and graceful shutdown, verified by **181 automated checks** (SQLite and
+> signed-request auth with scopes, Postgres state, observability and graceful shutdown, verified by **231 automated checks** (SQLite and
 > PostgreSQL, plus a run as an unprivileged user from a read-only tree). Bank connectivity is still **simulated**, and nothing has run against a real
 > cluster, bank or card network. See **[docs/PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md)** for exactly what is and is not covered, and the go-live checklist.
 
@@ -23,6 +23,7 @@ One service (`treasury/`) on top of the Ledger. **Every balance lives in the Led
 | **Credit, loans, guarantees** | Facilities with limits (Numscript overdraft), draw / repay / daily interest accrual; guarantees with partial cash collateral, claims (collateral → applicant → receivable), release. | tested |
 | **Sweeps & liquidity** | Full sweep (Numscript `[CCY *]`) or sweep-above-target; per-bank liquidity view with rebalancing suggestions. | tested |
 | **Reconciliation** | Applies statement credits (suspense if unattributable), matches debits to settled payouts, flags stray debits / mismatches; idempotent re-runs. | tested |
+| **Stripe Issuing** | Real-time authorization webhook (`/stripe/issuing/authorizations`) decides each swipe with a Ledger hold on the card's wallet; captures (hold first, wallet for over/force capture), refunds, refund reversals and authorization close-out from `/stripe/webhooks`. Stripe-Signature verified with the Stripe SDK; replay-safe on Stripe object ids. Works for virtual cards and Apple Pay / Google Pay tokens (the engine only ever sees `ic_` card ids). | tested (Stripe-documented payloads) |
 | **Rafiki intake** | Rafiki webhooks (replayed from real recorded events) post into the same wallets, idempotent on event id. | tested (recorded events) |
 | **Ledger integrity** | Sum of all balances incl. `world` is exactly 0 for USD and EUR after the whole run. | tested |
 

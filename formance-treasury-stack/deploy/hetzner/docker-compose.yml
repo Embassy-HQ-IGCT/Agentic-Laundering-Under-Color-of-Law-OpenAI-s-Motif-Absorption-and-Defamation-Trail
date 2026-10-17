@@ -50,6 +50,8 @@ services:
       DATABASE_URL: postgresql://treasury:${POSTGRES_PASSWORD}@postgres:5432/treasury
       TREASURY_API_KEYS: "${TREASURY_API_KEYS:?}"
       RAFIKI_WEBHOOK_SECRET: "${RAFIKI_WEBHOOK_SECRET:-}"
+      STRIPE_ISSUING_AUTH_WEBHOOK_SECRET: "${STRIPE_ISSUING_AUTH_WEBHOOK_SECRET:-}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
       MAX_BODY_BYTES: "4194304"          # bank statement uploads
       BANKS_JSON: "${BANKS_JSON:?see README: bank config}"
     read_only: true

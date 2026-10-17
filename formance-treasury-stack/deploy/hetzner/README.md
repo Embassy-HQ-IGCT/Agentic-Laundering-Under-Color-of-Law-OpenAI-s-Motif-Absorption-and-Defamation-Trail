@@ -40,4 +40,8 @@ When CashPro API access is granted, replace the bank type with the API adapter; 
 - `./backup.sh` nightly (cron): Postgres dump + Ledger volume copy (brief Ledger stop), checksums. Ship off-box; rehearse `./restore.sh <dir>`.
 - Admin access over WireGuard/Tailscale only; expose just 80/443.
 - Upgrades: `git pull && ./up.sh`. Rotate by editing `sops secrets.enc.env` then `./up.sh`.
+- Stripe Issuing: in the Stripe dashboard set the Issuing real-time authorization endpoint to `https://$DOMAIN/stripe/issuing/authorizations`
+  and a webhook endpoint `https://$DOMAIN/stripe/webhooks` for `issuing_transaction.created` and `issuing_authorization.updated`.
+  Add both signing secrets with `sops secrets.enc.env` as `STRIPE_ISSUING_AUTH_WEBHOOK_SECRET` and `STRIPE_WEBHOOK_SECRET`, then `./up.sh`.
+  Register each card with `POST /cards {"card_id":"ic_...","wallet":"<treasury wallet id>"}`.
 - Not covered here: Rafiki (run its own stack and point its webhooks at `/rafiki/webhooks`), HA (single node), sanctions/AML.

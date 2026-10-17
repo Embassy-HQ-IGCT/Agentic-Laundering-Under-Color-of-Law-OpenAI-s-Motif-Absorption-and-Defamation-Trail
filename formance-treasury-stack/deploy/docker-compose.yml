@@ -60,6 +60,8 @@ services:
       DATABASE_URL: postgresql://treasury:${POSTGRES_PASSWORD}@postgres:5432/treasury
       TREASURY_API_KEYS: "${TREASURY_API_KEYS:?set TREASURY_API_KEYS, e.g. export TREASURY_API_KEYS=$(make -s keys)}"
       RAFIKI_WEBHOOK_SECRET: ${RAFIKI_WEBHOOK_SECRET:-}
+      STRIPE_ISSUING_AUTH_WEBHOOK_SECRET: ${STRIPE_ISSUING_AUTH_WEBHOOK_SECRET:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     ports: ["127.0.0.1:8200:8200"]            # API on localhost only; metrics (9100) stay inside the compose network
     read_only: true
     tmpfs: [/tmp]

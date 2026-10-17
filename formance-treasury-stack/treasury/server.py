@@ -6,12 +6,15 @@ Security model
   * Every route except /livez and /readyz requires a signed request:  X-Key-Id, X-Timestamp (unix s), X-Signature =
     hex(HMAC-SHA256(secret, "<ts>\\n<METHOD>\\n<path?query>\\n<sha256(body)>")). +/-300 s replay window. Keys carry SCOPES and a rate limit.
   * Rafiki webhooks are authenticated by Rafiki's own signature (Rafiki-Signature: t=<ms>, v1=<hmac>) with RAFIKI_WEBHOOK_SECRET.
+  * Stripe Issuing webhooks are authenticated by Stripe-Signature (stripe.WebhookSignature): the synchronous authorization endpoint
+    with STRIPE_ISSUING_AUTH_WEBHOOK_SECRET, the event endpoint with STRIPE_WEBHOOK_SECRET.
   * Mutations are idempotent and bound to their request content (same id + different body -> 409).
   * Production mode (default) refuses to start with: no API keys, mock banks, the test clock, or the admin/test endpoints.
 Operations
   * /livez, /readyz (ledger + db + not draining) on the API port; Prometheus /metrics on METRICS_PORT (keep it cluster-internal).
   * JSON access logs, graceful SIGTERM drain, and a background recovery loop (resume stuck payouts, resolve unknown outcomes, expire holds).
-Env: TREASURY_ENV (prod|test), DATABASE_URL, LEDGER_URL, LEDGER_NAME, TREASURY_API_KEYS (json), RAFIKI_WEBHOOK_SECRET, PORT, METRICS_PORT,
+Env: TREASURY_ENV (prod|test), DATABASE_URL, LEDGER_URL, LEDGER_NAME, TREASURY_API_KEYS (json), RAFIKI_WEBHOOK_SECRET,
+     STRIPE_ISSUING_AUTH_WEBHOOK_SECRET, STRIPE_WEBHOOK_SECRET, PORT, METRICS_PORT,
      TREASURY_BG (1|0), TREASURY_BG_INTERVAL_S, MAX_BODY_BYTES, BANKS_JSON, TREASURY_ALLOW_MOCK_BANKS, FX_RATES_JSON.
 """
 import datetime as dt
@@ -29,6 +32,8 @@ import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import stripe
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rails as railmod
 from banks import load_banks
@@ -43,6 +48,8 @@ REPLAY_WINDOW_S = 300
 T = None                      # Treasury instance (set in main)
 KEYS = {}                     # key id -> {"secret","scopes","rps"}
 RAFIKI_SECRET = os.environ.get("RAFIKI_WEBHOOK_SECRET", "")
+STRIPE_SECRETS = {"STRIPE_AUTH": os.environ.get("STRIPE_ISSUING_AUTH_WEBHOOK_SECRET", ""),
+                  "STRIPE": os.environ.get("STRIPE_WEBHOOK_SECRET", "")}
 DRAINING = threading.Event()
 
 # ------------------------------------------------------------------------------------------------ metrics
@@ -161,6 +168,17 @@ def verify_rafiki(h, body):
     if abs(time.time() * 1000 - t_ms) > REPLAY_WINDOW_S * 1000 or not hmac.compare_digest(expected, digest):
         raise AuthError(401, "invalid credentials")
     return "rafiki"
+
+
+def verify_stripe(h, body, scope):
+    secret = STRIPE_SECRETS[scope]
+    if not secret:
+        raise AuthError(503, "Stripe webhook secret not configured")
+    try:
+        stripe.WebhookSignature.verify_header(body.decode(), h.headers.get("Stripe-Signature", ""), secret, tolerance=REPLAY_WINDOW_S)
+    except (stripe.SignatureVerificationError, UnicodeDecodeError):
+        raise AuthError(401, "invalid credentials")
+    return "stripe"
 
 
 # ------------------------------------------------------------------------------------------------ routes
@@ -291,6 +309,15 @@ def _(h, b, m): return T.apply_inbound(m[0], b)
 @route("POST", "/rafiki/webhooks", "RAFIKI")
 def _(h, b, m): return T.rafiki_event(b)
 
+@route("POST", "/stripe/issuing/authorizations", "STRIPE_AUTH")
+def _(h, b, m):
+    if b.get("type") != "issuing_authorization.request":
+        return 400, {"error": "expected issuing_authorization.request"}
+    return 200, T.stripe_issuing_authorization(b, now_of(h)), {"Stripe-Version": b["api_version"]}
+
+@route("POST", "/stripe/webhooks", "STRIPE")
+def _(h, b, m): return T.stripe_issuing_event(b, now_of(h))
+
 if TEST:      # fault injection and bank simulation - never registered in production
     @route("POST", "/admin/post", "admin")
     def _(h, b, m):
@@ -349,13 +376,14 @@ class H(BaseHTTPRequestHandler):
         super().setup()
         self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def _send(self, code, body):
+    def _send(self, code, body, headers=None):
         raw = json.dumps(body).encode()
         conn = "close" if DRAINING.is_set() else "keep-alive"
         if conn == "close":
             self.close_connection = True
         head = (f"HTTP/1.1 {code} {'OK' if code < 300 else 'ERR'}\r\nContent-Type: application/json\r\nContent-Length: {len(raw)}\r\n"
-                f"Connection: {conn}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n\r\n").encode()
+                f"Connection: {conn}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n"
+                + "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items()) + "\r\n").encode()
         self.wfile.write(head + raw)
         self.wfile.flush()
         return code
@@ -381,6 +409,8 @@ class H(BaseHTTPRequestHandler):
                 try:
                     if scope == "RAFIKI":
                         actor = verify_rafiki(self, raw)
+                    elif scope in STRIPE_SECRETS:
+                        actor = verify_stripe(self, raw, scope)
                     elif scope:
                         actor = authenticate(self, method, target, raw, scope)
                     try:
@@ -479,6 +509,9 @@ def preflight():
             problems.append("TREASURY_API_KEYS is empty: refusing to serve unauthenticated money movement")
         if not RAFIKI_SECRET:
             log("warn", msg="RAFIKI_WEBHOOK_SECRET unset: /rafiki/webhooks will reject all requests")
+        for scope, var in (("STRIPE_AUTH", "STRIPE_ISSUING_AUTH_WEBHOOK_SECRET"), ("STRIPE", "STRIPE_WEBHOOK_SECRET")):
+            if not STRIPE_SECRETS[scope]:
+                log("warn", msg=f"{var} unset: its Stripe endpoint will reject all requests")
     if problems:
         raise RuntimeError("refusing to start: " + "; ".join(problems))
 

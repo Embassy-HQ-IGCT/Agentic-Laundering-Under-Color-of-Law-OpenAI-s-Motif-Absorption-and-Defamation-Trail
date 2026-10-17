@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- Stripe Issuing binding: real-time authorization webhook -> Ledger hold on the card's wallet; captures, refunds, refund reversals and
+  close-out from the event webhook; Stripe SDK signature verification (`stripe==15.6.1`). 24 new checks.
+- Test harness: one fresh PostgreSQL database per engine stage (the shared database made the manual-bank reconciliation see other
+  suites' payouts). 231 checks pass on SQLite, PostgreSQL and the hardened run.
 - Operator-assisted bank adapter (`type: manual`): live wires through a bank portal with no API - idempotent instruction queue,
   CSV/BAI2 statement ingest that settles payouts by `PAY:<id>`, operator sent/failed actions, reconciliation. 17 new checks (190 total).
 - Single-host deploy kit (`deploy/hetzner`): Compose + Caddy TLS, sops/age secrets, backup/restore scripts.

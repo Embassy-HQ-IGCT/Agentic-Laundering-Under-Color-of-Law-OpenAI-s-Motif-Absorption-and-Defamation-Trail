@@ -159,6 +159,17 @@ send $amt (
 )"""
 
 
+NS_CLEARING_CREDIT = """vars {
+  account $clearing
+  account $wallet
+  monetary $amt
+}
+send $amt (
+  source = $clearing allowing unbounded overdraft
+  destination = $wallet
+)"""
+
+
 TERMINAL = ("settled", "failed")
 IN_FLIGHT = ("new", "reserved", "routing")
 
@@ -977,3 +988,66 @@ class Treasury:
         except InsufficientFunds:
             raise Declined("insufficient funds for Rafiki outgoing payment")
         return {"posted": t, "ledger_tx": r["id"], "duplicate": r["dup"]}
+
+    # ------------------------------------------------------------------------------------------- Stripe Issuing
+    # issuing_authorization.request -> hold on the card's wallet (card_authorize). issuing_transaction.created -> capture into
+    # card:clearing (hold first, wallet for any excess/force capture) or refund out of it. issuing_authorization.updated
+    # (closed|reversed|expired) -> release the remaining hold. Ledger reference stripe:<object id> makes every event replay-safe.
+    def stripe_issuing_authorization(self, ev, now):
+        o = ev["data"]["object"]
+        pr, md = o["pending_request"], o.get("merchant_data") or {}
+        card = o["card"]["id"] if isinstance(o["card"], dict) else o["card"]
+        if int(pr["amount"]) == 0:
+            c = self.q1("select status from cards where card_id=?", card)
+            return {"approved": bool(c and c["status"] == "active")}
+        r = self.card_authorize({"auth_id": o["id"], "card_id": card, "amount": int(pr["amount"]), "ccy": pr["currency"].upper(),
+                                 "merchant": md.get("name"), "mcc": md.get("category_code"), "country": md.get("country")}, now)
+        return {"approved": r["approved"], "metadata": {"response_code": r["response_code"], "reason": r["reason"]}}
+
+    def stripe_issuing_event(self, ev, now):
+        t, o = ev["type"], ev["data"]["object"]
+        if t == "issuing_transaction.created":
+            return self._stripe_transaction(o)
+        if t == "issuing_authorization.updated" and o.get("status") in ("closed", "reversed", "expired"):
+            if not self.q1("select 1 from auths where auth_id=?", o["id"]):
+                return {"ignored": t, "reason": "no hold for authorization"}
+            return self.card_reverse({"auth_id": o["id"]}, now)
+        return {"ignored": t}
+
+    def _stripe_transaction(self, o):
+        iid, amount, ccy = o["id"], int(o["amount"]), o["currency"].upper()
+        cid = o["card"]["id"] if isinstance(o["card"], dict) else o["card"]
+        card = self.q1("select wallet from cards where card_id=?", cid)
+        if not card:
+            raise NotFound(f"unknown card {cid}")
+        ref, wal, a, clearing = f"stripe:{iid}", W(card["wallet"]), asset(ccy), f"card:clearing:{ccy}"
+        aid = o.get("authorization")
+        aid = aid["id"] if isinstance(aid, dict) else aid
+        existing = self.led.tx_by_reference(ref)
+        if existing is None:
+            try:
+                if o["type"] == "capture" and amount < 0:
+                    amt, from_hold = -amount, 0
+                    auth = self.q1("select * from auths where auth_id=?", aid) if aid else None
+                    if auth and auth["status"] == "authorized":
+                        c, rel = self._auth_totals(aid)
+                        from_hold = min(amt, int(auth["held_wallet"]) + int(auth["held_credit"]) - c - rel)
+                    post = ([(f"holds:{aid}", clearing, from_hold, a)] if from_hold else []) + \
+                           ([(wal, clearing, amt - from_hold, a)] if amt > from_hold else [])
+                    r = self.led.tx(ref, post, metadata={"type": "card_capture", "source": "stripe_issuing", "card": cid})
+                elif o["type"] == "refund" and amount > 0:
+                    r = self.led.tx(ref, script=NS_CLEARING_CREDIT, vars={"clearing": clearing, "wallet": wal, "amt": f"{a} {amount}"},
+                                    metadata={"type": "card_refund", "source": "stripe_issuing", "card": cid})
+                elif o["type"] == "refund" and amount < 0:
+                    r = self.led.tx(ref, [(wal, clearing, -amount, a)], metadata={"type": "card_refund_reversal", "source": "stripe_issuing",
+                                                                                 "card": cid})
+                else:
+                    raise ValidationError(f"unsupported issuing transaction type={o['type']} amount={amount}")
+            except InsufficientFunds:
+                raise Declined("insufficient funds for captured card spend")
+            existing = {"id": r["id"], "postings": r["postings"] or (self.led.tx_by_reference(ref) or {}).get("postings") or []}
+        held = sum(int(p["amount"]) for p in existing["postings"] if p["source"] == f"holds:{aid}") if aid else 0
+        if held:
+            self.x("insert into auth_events values(?,?,?,?,?) on conflict do nothing", aid, "capture", iid, held, 0)
+        self.audit("card.stripe_transaction", iid, {"card": cid, "type": o["type"], "amount": amount, "from_hold": held})
+        return {"transaction": iid, "type": o["type"], "ledger_tx": existing["id"], "from_hold": held}

@@ -1,2 +1,3 @@
-# Only the PostgreSQL driver is third-party; everything else is Python stdlib. Pin exactly; add --require-hashes in your build.
+# Third-party: the PostgreSQL driver and the Stripe SDK (webhook signature verification); everything else is Python stdlib. Pin exactly; add --require-hashes in your build.
 psycopg[binary]==3.2.3
+stripe==15.6.1
