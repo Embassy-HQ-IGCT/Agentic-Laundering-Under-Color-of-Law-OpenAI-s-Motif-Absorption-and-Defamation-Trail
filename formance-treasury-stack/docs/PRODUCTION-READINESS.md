@@ -54,14 +54,9 @@ section is the blocking checklist.
 - [ ] Penetration test; legal/compliance sign-off (money transmission/banking licences, card programme rules, KYC/AML/sanctions).
 - [ ] Ledger HA and restore drill; Cloud SQL failover drill.
 
-## 5. Suggested alerts (Prometheus)
+## 5. Alerts (Prometheus)
 
-| Alert | Expression (sketch) |
-|---|---|
-| Payout outcome unknown | `treasury_payouts_needing_attention > 0` for 10 m |
-| Payouts stuck | `treasury_payouts{status=~"new\|reserved\|routing"} > 0` for 10 m (recovery loop should clear within ~1 m) |
-| Engine not ready | `kube_deployment_status_replicas_available{deployment="treasury-engine"} < 2` |
-| Error rate | `sum(rate(treasury_http_requests_total{status=~"5.."}[5m])) / sum(rate(treasury_http_requests_total[5m])) > 0.01` |
-| Authorization latency | `histogram_quantile(0.99, rate(treasury_http_request_seconds_bucket{route="/card/authorize"}[5m])) > 0.1` |
-| Auth attack / misconfig | `rate(treasury_http_requests_total{status=~"401\|403"}[5m]) > 1` |
-| Decline spike | `rate(treasury_card_decisions_total{approved="false"}[5m])` vs baseline |
+Shipped as a `PrometheusRule` plus `PodMonitor` in `gke/k8s/platform.yaml.tmpl`, labelled `release: kube-prometheus` for the existing
+kube-prometheus-stack. Seven rules: payout outcome unknown, payouts stuck, engine not ready, 5xx rate, card authorization p99
+(`/card/authorize` and `/stripe/issuing/authorizations`), 401/403 rate, card decline spike. `make alerts` renders the manifests and runs
+promtool lint and unit tests (`gke/alerts-test.yaml`, firing and quiet cases).

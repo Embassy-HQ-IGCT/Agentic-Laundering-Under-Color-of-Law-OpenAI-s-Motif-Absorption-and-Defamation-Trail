@@ -6,7 +6,7 @@ LEDGER_BIN  ?= $(BUILD)/ledger-bin
 LEDGERCTL   ?= $(BUILD)/ledgerctl
 SANDBOX_FLAGS ?=
 
-.PHONY: ledger test test-pg test-hardened lint audit keys clean
+.PHONY: ledger test test-pg test-hardened lint audit alerts keys clean
 
 ledger: $(LEDGER_BIN)
 $(LEDGER_BIN):
@@ -33,6 +33,9 @@ lint:
 audit:
 	mkdir -p $(BUILD)
 	gke/gke-deploy.sh --render-only --non-interactive --config gke/ci-answers.env --out $(BUILD)/render
+
+alerts:  ## promtool lint + unit tests of the PrometheusRule (needs promtool)
+	gke/test-alerts.sh
 
 keys:  ## print a fresh TREASURY_API_KEYS value for deploy/docker-compose.yml
 	@python3 -c "import json,secrets;print(json.dumps({k:{'secret':secrets.token_urlsafe(48),'scopes':s,'rps':200} for k,s in {'ops':['*']}.items()}))"

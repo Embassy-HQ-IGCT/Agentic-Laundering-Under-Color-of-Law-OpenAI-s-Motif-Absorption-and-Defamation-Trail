@@ -67,8 +67,8 @@ def observe(route, method, status, secs, body=None):
         for i, b in enumerate(BUCKETS):
             if secs <= b:
                 h["b"][i] += 1
-        if route == "/card/authorize" and isinstance(body, dict) and "approved" in body:
-            k = (str(body["approved"]).lower(), str(body.get("response_code")))
+        if route in ("/card/authorize", "/stripe/issuing/authorizations") and isinstance(body, dict) and "approved" in body:
+            k = (str(body["approved"]).lower(), str(body.get("response_code") or (body.get("metadata") or {}).get("response_code")))
             CARD[k] = CARD.get(k, 0) + 1
 
 

@@ -297,3 +297,54 @@ metadata: { name: rafiki-ledger-bridge, namespace: ${NAMESPACE} }
 spec:
   selector: { app: rafiki-ledger-bridge }
   ports: [{ port: 3100, targetPort: 3100 }]
+---
+# ------------------------------------------------------------ monitoring (kube-prometheus-stack: release label selects these)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: { name: treasury-engine, namespace: ${NAMESPACE}, labels: { release: kube-prometheus } }
+spec:
+  selector: { matchLabels: { app: treasury-engine } }
+  podMetricsEndpoints: [{ port: metrics, path: /metrics, interval: 30s }]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: { name: treasury-engine, namespace: ${NAMESPACE}, labels: { release: kube-prometheus } }
+spec:
+  groups:
+    - name: treasury-engine
+      rules:
+        - alert: TreasuryPayoutOutcomeUnknown
+          expr: max(treasury_payouts_needing_attention) > 0
+          for: 10m
+          labels: { severity: critical }
+          annotations: { summary: "Payout in review: bank outcome unknown. Resolve by lookup before any retry (RUNBOOK)." }
+        - alert: TreasuryPayoutsStuck
+          expr: max(treasury_payouts{status=~"new|reserved|routing"}) > 0
+          for: 10m
+          labels: { severity: warning }
+          annotations: { summary: "Payouts not progressing; recovery loop clears within ~1m when healthy." }
+        - alert: TreasuryEngineNotReady
+          expr: sum(up{namespace="${NAMESPACE}", pod=~"treasury-engine-.*"}) < 2
+          for: 5m
+          labels: { severity: critical }
+          annotations: { summary: "Fewer than 2 treasury-engine replicas are being scraped." }
+        - alert: TreasuryErrorRate
+          expr: sum(rate(treasury_http_requests_total{status=~"5.."}[5m])) / sum(rate(treasury_http_requests_total[5m])) > 0.01
+          for: 5m
+          labels: { severity: critical }
+          annotations: { summary: "More than 1% of engine requests return 5xx." }
+        - alert: TreasuryCardAuthorizationLatency
+          expr: histogram_quantile(0.99, sum by (le, route) (rate(treasury_http_request_seconds_bucket{route=~"/card/authorize|/stripe/issuing/authorizations"}[5m]))) > 0.1
+          for: 5m
+          labels: { severity: warning }
+          annotations: { summary: "p99 card authorization latency above 100 ms (Stripe allows 2 s)." }
+        - alert: TreasuryAuthFailures
+          expr: sum(rate(treasury_http_requests_total{status=~"401|403"}[5m])) > 1
+          for: 5m
+          labels: { severity: warning }
+          annotations: { summary: "Sustained 401/403: misconfigured client or attack." }
+        - alert: TreasuryCardDeclineSpike
+          expr: sum(rate(treasury_card_decisions_total{approved="false"}[15m])) / sum(rate(treasury_card_decisions_total[15m])) > 0.5 and sum(rate(treasury_card_decisions_total[15m])) > 0.05
+          for: 10m
+          labels: { severity: warning }
+          annotations: { summary: "Over half of card authorizations declined." }

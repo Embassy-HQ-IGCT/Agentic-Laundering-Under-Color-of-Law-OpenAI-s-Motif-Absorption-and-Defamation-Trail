@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Alerts: PrometheusRule (7 rules) + PodMonitor for the existing kube-prometheus-stack; promtool unit tests (`make alerts`).
+- Fix: Stripe real-time authorization decisions are now counted in `treasury_card_decisions_total`.
 - Stripe Issuing binding: real-time authorization webhook -> Ledger hold on the card's wallet; captures, refunds, refund reversals and
   close-out from the event webhook; Stripe SDK signature verification (`stripe==15.6.1`). 24 new checks.
 - Test harness: one fresh PostgreSQL database per engine stage (the shared database made the manual-bank reconciliation see other

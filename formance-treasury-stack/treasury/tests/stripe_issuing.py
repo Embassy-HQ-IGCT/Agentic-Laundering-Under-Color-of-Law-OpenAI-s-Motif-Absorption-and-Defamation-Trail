@@ -87,6 +87,12 @@ ok("event secret not accepted on the authorization endpoint -> 401", s == 401, (
 s, b, _ = post(EVP, txn(f"ipi_{R}x", card, "capture", -100), AUTH_SECRET)
 ok("authorization secret not accepted on the event endpoint -> 401", s == 401, (s, b))
 
+def decisions():
+    t = client.metrics()
+    return sum(float(l.rsplit(" ", 1)[1]) for l in t.splitlines() if l.startswith("treasury_card_decisions_total{"))
+
+
+d0 = decisions()
 print("== real-time authorization")
 a1 = f"iauth_{R}1"
 s, b, ver = post(AUTHP, auth_req(a1, card, 1_000), AUTH_SECRET)
@@ -103,6 +109,8 @@ s, b, _ = post(AUTHP, auth_req(f"iauth_{R}4", card, 0), AUTH_SECRET)
 ok("zero-amount verification on an active card approved, no hold", s == 200 and b.get("approved") is True and bal(W) == 9_000, (b, bal(W)))
 s, b, _ = post(AUTHP, auth_req(f"iauth_{R}5", f"ic_unknown{R}", 0), AUTH_SECRET)
 ok("zero-amount verification on an unknown card declined", s == 200 and b.get("approved") is False, b)
+
+ok("real-time decisions counted in treasury_card_decisions_total", decisions() - d0 == 6, decisions() - d0)
 
 print("== capture, close-out, refunds")
 s, b, _ = post(EVP, txn(f"ipi_{R}1", card, "capture", -600, a1), EV_SECRET)
