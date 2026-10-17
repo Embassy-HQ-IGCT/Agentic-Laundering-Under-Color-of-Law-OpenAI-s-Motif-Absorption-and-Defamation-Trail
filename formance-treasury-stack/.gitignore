@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.build/
+*.db
+*.db-wal
+*.db-shm
+.env
+out/
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+tfplan

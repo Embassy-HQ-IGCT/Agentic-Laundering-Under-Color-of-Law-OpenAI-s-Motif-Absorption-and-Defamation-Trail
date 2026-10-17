@@ -1,0 +1,7 @@
+# Bridge image: Rafiki webhooks -> Formance Ledger postings. Built FROM the Ledger image so ledgerctl is already present.
+ARG LEDGER_IMAGE
+FROM ${LEDGER_IMAGE}
+RUN apk --no-cache add python3
+COPY rafiki_formance_bridge.py /app/bridge.py
+ENV LEDGERCTL=/app/ledgerctl BRIDGE_BIND=0.0.0.0
+ENTRYPOINT ["python3", "/app/bridge.py"]

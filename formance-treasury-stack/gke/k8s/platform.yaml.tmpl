@@ -1,0 +1,350 @@
+# Rendered by gke-deploy.sh with envsubst. Secrets are created by the script from Secret Manager, never stored here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${KSA}
+  namespace: ${NAMESPACE}
+  annotations:
+    iam.gke.io/gcp-service-account: ${APP_GSA}
+---
+# ------------------------------------------------------------ Temporal (workflow engine for Formance Payments)
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: temporal, namespace: ${NAMESPACE} }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: temporal } }
+  template:
+    metadata: { labels: { app: temporal } }
+    spec:
+      serviceAccountName: ${KSA}
+      containers:
+        - name: temporal
+          image: temporalio/auto-setup:1.29.1
+          ports: [{ containerPort: 7233 }]
+          env:
+            - { name: DB, value: postgres12 }
+            - { name: DB_PORT, value: "5432" }
+            - { name: POSTGRES_SEEDS, value: "${SQL_IP}" }
+            - { name: POSTGRES_USER, value: temporal }
+            - { name: DBNAME, value: temporal }
+            - { name: VISIBILITY_DBNAME, value: temporal_visibility }
+            - name: POSTGRES_PWD
+              valueFrom: { secretKeyRef: { name: db-passwords, key: temporal } }
+          resources: { requests: { cpu: 500m, memory: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: temporal, namespace: ${NAMESPACE} }
+spec:
+  selector: { app: temporal }
+  ports: [{ port: 7233, targetPort: 7233 }]
+---
+# ------------------------------------------------------------ Formance Payments (community)
+apiVersion: batch/v1
+kind: Job
+metadata: { name: payments-migrate, namespace: ${NAMESPACE} }
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${KSA}
+      containers:
+        - name: migrate
+          image: ${PAYMENTS_IMAGE}
+          args: ["migrate", "up"]
+          env:
+            - name: POSTGRES_URI
+              valueFrom: { secretKeyRef: { name: app-secrets, key: payments-postgres-uri } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: payments-server, namespace: ${NAMESPACE} }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: payments-server } }
+  template:
+    metadata: { labels: { app: payments-server } }
+    spec:
+      serviceAccountName: ${KSA}
+      containers:
+        - name: payments
+          image: ${PAYMENTS_IMAGE}
+          args: ["server"]
+          ports: [{ containerPort: 8080 }]
+          envFrom: [{ secretRef: { name: payments-env } }]
+          env:
+            - { name: TEMPORAL_ADDRESS, value: "temporal:7233" }
+            - { name: TEMPORAL_INIT_SEARCH_ATTRIBUTES, value: "true" }
+            - { name: STACK_PUBLIC_URL, value: "${PAYMENTS_PUBLIC_URL}" }
+          readinessProbe: { httpGet: { path: /_healthcheck, port: 8080 } }
+          livenessProbe: { httpGet: { path: /_healthcheck, port: 8080 }, initialDelaySeconds: 20 }
+          resources: { requests: { cpu: 250m, memory: 512Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: payments-worker, namespace: ${NAMESPACE} }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: payments-worker } }
+  template:
+    metadata: { labels: { app: payments-worker } }
+    spec:
+      serviceAccountName: ${KSA}
+      containers:
+        - name: worker
+          image: ${PAYMENTS_IMAGE}
+          args: ["worker", "--listen", ":8082", "--profiler-listen", ":9191"]
+          envFrom: [{ secretRef: { name: payments-env } }]
+          env:
+            - { name: TEMPORAL_ADDRESS, value: "temporal:7233" }
+            - { name: STACK_PUBLIC_URL, value: "${PAYMENTS_PUBLIC_URL}" }
+          readinessProbe: { httpGet: { path: /_healthcheck, port: 8082 } }
+          resources: { requests: { cpu: 250m, memory: 512Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: payments, namespace: ${NAMESPACE} }
+spec:
+  selector: { app: payments-server }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+# ------------------------------------------------------------ Formance Ledger v3 (single Raft node; add voters for HA)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: ledger, namespace: ${NAMESPACE} }
+spec:
+  serviceName: ledger
+  replicas: 1
+  selector: { matchLabels: { app: ledger } }
+  template:
+    metadata: { labels: { app: ledger } }
+    spec:
+      serviceAccountName: ${KSA}
+      containers:
+        - name: ledger
+          image: ${LEDGER_IMAGE}
+          args:
+            - run
+            - --node-id=1
+            - --cluster-id=${LEDGER_CLUSTER_ID}
+            - --bootstrap
+            - --bind-addr=0.0.0.0:7777
+            - --grpc-port=8888
+            - --http-port=9000
+            - --wal-dir=/data/wal
+            - --data-dir=/data/db
+          ports: [{ containerPort: 8888 }, { containerPort: 9000 }, { containerPort: 7777 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+          readinessProbe: { httpGet: { path: /readyz, port: 9000 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /livez, port: 9000 }, initialDelaySeconds: 20, periodSeconds: 10, failureThreshold: 6 }
+          resources: { requests: { cpu: 500m, memory: 1Gi }, limits: { memory: 2Gi } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: ${LEDGER_DISK_GI}Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: ledger, namespace: ${NAMESPACE} }
+spec:
+  clusterIP: None
+  selector: { app: ledger }
+  ports: [{ name: grpc, port: 8888 }, { name: http, port: 9000 }]
+---
+# ------------------------------------------------------------ Ledger bootstrap (creates the ledger and its REQUIRED reference index)
+apiVersion: batch/v1
+kind: Job
+metadata: { name: ledger-bootstrap, namespace: ${NAMESPACE} }
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${KSA}
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: bootstrap
+          image: ${LEDGER_IMAGE}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              L="/app/ledgerctl --insecure --server ledger-0.ledger:8888"
+              $L ledgers create treasury || echo "ledger create: already exists or failed (verified below)"
+              $L indexes create --ledger treasury --type reference || echo "index create: already exists or failed (verified below)"
+              for i in $(seq 60); do
+                wget -q -O /dev/null 'http://ledger-0.ledger:9000/v3/treasury/transactions?pageSize=1&filter=%7B%22%24match%22%3A%7B%22reference%22%3A%22probe%22%7D%7D' && echo "reference index READY" && exit 0
+                sleep 2
+              done
+              echo "reference index never became ready" >&2; exit 1
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
+---
+# ------------------------------------------------------------ Treasury engine (card auth, payouts, FX, credit, recon, Rafiki intake)
+# Stateless replicas: money lives in the Ledger, workflow state in Cloud SQL (Postgres). Payout leases + idempotent bank/ledger steps make
+# concurrent replicas and rolling restarts safe. The engine refuses to start without Postgres, API keys, and real (non-mock) banks.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: treasury-engine, namespace: ${NAMESPACE} }
+spec:
+  replicas: 2
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  selector: { matchLabels: { app: treasury-engine } }
+  template:
+    metadata:
+      labels: { app: treasury-engine }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9100", prometheus.io/path: /metrics }
+    spec:
+      serviceAccountName: ${KSA}
+      terminationGracePeriodSeconds: 30
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: RuntimeDefault } }
+      topologySpreadConstraints:
+        - { maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway, labelSelector: { matchLabels: { app: treasury-engine } } }
+      containers:
+        - name: engine
+          image: ${ENGINE_IMAGE}
+          ports: [{ name: api, containerPort: 8200 }, { name: metrics, containerPort: 9100 }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          env:
+            - { name: TREASURY_ENV, value: prod }
+            - { name: LEDGER_URL, value: "http://ledger-0.ledger:9000" }
+            - { name: LEDGER_NAME, value: "treasury" }
+            - { name: PORT, value: "8200" }
+            - { name: METRICS_PORT, value: "9100" }
+            - { name: TREASURY_ALLOW_MOCK_BANKS, value: "${ALLOW_MOCK_BANKS}" }
+            - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: treasury-engine-env, key: DATABASE_URL } } }
+            - { name: TREASURY_API_KEYS, valueFrom: { secretKeyRef: { name: treasury-engine-env, key: TREASURY_API_KEYS } } }
+            - { name: RAFIKI_WEBHOOK_SECRET, valueFrom: { secretKeyRef: { name: treasury-engine-env, key: RAFIKI_WEBHOOK_SECRET } } }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+          startupProbe: { httpGet: { path: /livez, port: api }, failureThreshold: 30, periodSeconds: 2 }
+          livenessProbe: { httpGet: { path: /livez, port: api }, periodSeconds: 10, failureThreshold: 3 }
+          readinessProbe: { httpGet: { path: /readyz, port: api }, periodSeconds: 5, failureThreshold: 2 }
+          lifecycle: { preStop: { exec: { command: ["/bin/sleep", "5"] } } }
+          resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 512Mi } }
+      volumes: [{ name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: treasury-engine, namespace: ${NAMESPACE} }
+spec:
+  selector: { app: treasury-engine }
+  ports: [{ name: api, port: 8200, targetPort: api }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: treasury-engine, namespace: ${NAMESPACE} }
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: treasury-engine } }
+---
+# Network policy for the engine only (verify pod labels of your Rafiki/ingress before tightening further).
+# Ingress: from pods in this namespace and from the ingress namespace. Egress: DNS, the Ledger, Postgres/Redis (VPC), HTTPS to bank endpoints.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: treasury-engine, namespace: ${NAMESPACE} }
+spec:
+  podSelector: { matchLabels: { app: treasury-engine } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{ podSelector: {} }, { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ${INGRESS_NAMESPACE} } } }]
+      ports: [{ port: 8200 }]
+    - from: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ${MONITORING_NAMESPACE} } } }]
+      ports: [{ port: 9100 }]
+  egress:
+    - to: [{ namespaceSelector: {}, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ podSelector: { matchLabels: { app: ledger } } }]
+      ports: [{ port: 9000 }]
+    - to: [{ ipBlock: { cidr: ${VPC_CIDR} } }]
+      ports: [{ port: 5432 }]
+    - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] } }]
+      ports: [{ port: 443 }]
+---
+# ------------------------------------------------------------ (legacy) Rafiki -> Ledger bridge; superseded by the engine's /rafiki/webhooks
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: rafiki-ledger-bridge, namespace: ${NAMESPACE} }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: rafiki-ledger-bridge } }
+  template:
+    metadata: { labels: { app: rafiki-ledger-bridge } }
+    spec:
+      serviceAccountName: ${KSA}
+      containers:
+        - name: bridge
+          image: ${BRIDGE_IMAGE}
+          ports: [{ containerPort: 3100 }]
+          env:
+            - { name: LEDGER_SERVER, value: "ledger-0.ledger:8888" }
+            - { name: LEDGER_NAME, value: "rafiki" }
+            - { name: BRIDGE_PORT, value: "3100" }
+          readinessProbe: { httpGet: { path: /rates, port: 3100 } }
+          resources: { requests: { cpu: 100m, memory: 128Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rafiki-ledger-bridge, namespace: ${NAMESPACE} }
+spec:
+  selector: { app: rafiki-ledger-bridge }
+  ports: [{ port: 3100, targetPort: 3100 }]
+---
+# ------------------------------------------------------------ monitoring (kube-prometheus-stack: release label selects these)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: { name: treasury-engine, namespace: ${NAMESPACE}, labels: { release: kube-prometheus } }
+spec:
+  selector: { matchLabels: { app: treasury-engine } }
+  podMetricsEndpoints: [{ port: metrics, path: /metrics, interval: 30s }]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: { name: treasury-engine, namespace: ${NAMESPACE}, labels: { release: kube-prometheus } }
+spec:
+  groups:
+    - name: treasury-engine
+      rules:
+        - alert: TreasuryPayoutOutcomeUnknown
+          expr: max(treasury_payouts_needing_attention) > 0
+          for: 10m
+          labels: { severity: critical }
+          annotations: { summary: "Payout in review: bank outcome unknown. Resolve by lookup before any retry (RUNBOOK)." }
+        - alert: TreasuryPayoutsStuck
+          expr: max(treasury_payouts{status=~"new|reserved|routing"}) > 0
+          for: 10m
+          labels: { severity: warning }
+          annotations: { summary: "Payouts not progressing; recovery loop clears within ~1m when healthy." }
+        - alert: TreasuryEngineNotReady
+          expr: sum(up{namespace="${NAMESPACE}", pod=~"treasury-engine-.*"}) < 2
+          for: 5m
+          labels: { severity: critical }
+          annotations: { summary: "Fewer than 2 treasury-engine replicas are being scraped." }
+        - alert: TreasuryErrorRate
+          expr: sum(rate(treasury_http_requests_total{status=~"5.."}[5m])) / sum(rate(treasury_http_requests_total[5m])) > 0.01
+          for: 5m
+          labels: { severity: critical }
+          annotations: { summary: "More than 1% of engine requests return 5xx." }
+        - alert: TreasuryCardAuthorizationLatency
+          expr: histogram_quantile(0.99, sum by (le, route) (rate(treasury_http_request_seconds_bucket{route=~"/card/authorize|/stripe/issuing/authorizations"}[5m]))) > 0.1
+          for: 5m
+          labels: { severity: warning }
+          annotations: { summary: "p99 card authorization latency above 100 ms (Stripe allows 2 s)." }
+        - alert: TreasuryAuthFailures
+          expr: sum(rate(treasury_http_requests_total{status=~"401|403"}[5m])) > 1
+          for: 5m
+          labels: { severity: warning }
+          annotations: { summary: "Sustained 401/403: misconfigured client or attack." }
+        - alert: TreasuryCardDeclineSpike
+          expr: sum(rate(treasury_card_decisions_total{approved="false"}[15m])) / sum(rate(treasury_card_decisions_total[15m])) > 0.5 and sum(rate(treasury_card_decisions_total[15m])) > 0.05
+          for: 10m
+          labels: { severity: warning }
+          annotations: { summary: "Over half of card authorizations declined." }

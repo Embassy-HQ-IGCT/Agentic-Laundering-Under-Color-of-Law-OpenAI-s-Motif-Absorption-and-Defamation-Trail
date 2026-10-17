@@ -1,0 +1,71 @@
+# Single-host LIVE stack (Hetzner / DigitalOcean / any Docker host): Postgres + Formance Ledger v3 + treasury engine + Caddy TLS.
+# Banks: operator-assisted wires (BofA online banking) via the engine's "manual" bank type - see README.md.
+# STATUS: written to match the natively-verified components; the compose file itself has NOT been run end to end - expect small fixes.
+# Secrets come from sops (see bootstrap.sh / up.sh); nothing secret lives in this file.
+name: treasury
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment: { POSTGRES_USER: treasury, POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?}", POSTGRES_DB: treasury }
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U treasury -d treasury"], interval: 5s, retries: 20 }
+
+  ledger:
+    image: treasury-ledger:${LEDGER_REF:-9a4bb29c8670}
+    build:
+      context: https://github.com/formancehq/ledger.git#${LEDGER_REF:-9a4bb29c8670e6f8c1a166bb85d31d26107f18a2}
+    restart: unless-stopped
+    command: ["run", "--node-id=1", "--cluster-id=live", "--bootstrap", "--bind-addr=0.0.0.0:7777", "--grpc-port=8888",
+              "--http-port=9000", "--wal-dir=/data/wal", "--data-dir=/data/db"]
+    volumes: [ledgerdata:/data]
+    healthcheck: { test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9000/health"], interval: 5s, retries: 30 }
+
+  ledger-bootstrap:      # creates the ledger and its REQUIRED reference index
+    image: treasury-ledger:${LEDGER_REF:-9a4bb29c8670}
+    depends_on: { ledger: { condition: service_healthy } }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /app/ledgerctl --insecure --server ledger:8888 ledgers create treasury || true
+        /app/ledgerctl --insecure --server ledger:8888 indexes create --ledger treasury --type reference || true
+        for i in $$(seq 60); do
+          wget -q -O /dev/null 'http://ledger:9000/v3/treasury/transactions?pageSize=1&filter=%7B%22%24match%22%3A%7B%22reference%22%3A%22probe%22%7D%7D' && echo READY && exit 0
+          sleep 2
+        done
+        exit 1
+    restart: "no"
+
+  engine:
+    build: ../../treasury
+    image: treasury-engine:live
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      ledger-bootstrap: { condition: service_completed_successfully }
+    environment:
+      TREASURY_ENV: prod
+      LEDGER_URL: http://ledger:9000
+      LEDGER_NAME: treasury
+      DATABASE_URL: postgresql://treasury:${POSTGRES_PASSWORD}@postgres:5432/treasury
+      TREASURY_API_KEYS: "${TREASURY_API_KEYS:?}"
+      RAFIKI_WEBHOOK_SECRET: "${RAFIKI_WEBHOOK_SECRET:-}"
+      STRIPE_ISSUING_AUTH_WEBHOOK_SECRET: "${STRIPE_ISSUING_AUTH_WEBHOOK_SECRET:-}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
+      MAX_BODY_BYTES: "4194304"          # bank statement uploads
+      BANKS_JSON: "${BANKS_JSON:?see README: bank config}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    expose: ["8200"]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [engine]
+    ports: ["80:80", "443:443"]
+    environment: { DOMAIN: "${DOMAIN:?}" }
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddydata:/data]
+
+volumes: { pgdata: {}, ledgerdata: {}, caddydata: {} }

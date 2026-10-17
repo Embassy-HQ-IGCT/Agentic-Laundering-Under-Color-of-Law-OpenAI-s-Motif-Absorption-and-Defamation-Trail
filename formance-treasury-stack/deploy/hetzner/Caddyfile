@@ -1,0 +1,6 @@
+{$DOMAIN} {
+	encode zstd gzip
+	@blocked path /admin/*
+	respond @blocked 404
+	reverse_proxy engine:8200
+}

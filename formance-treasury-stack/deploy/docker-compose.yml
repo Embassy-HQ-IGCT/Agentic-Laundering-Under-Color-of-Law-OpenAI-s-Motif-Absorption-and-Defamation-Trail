@@ -1,0 +1,73 @@
+# FREE LOCAL STACK: Ledger v3 + PostgreSQL + the treasury engine, on one machine. Banks are SIMULATED (no real money moves).
+# STATUS: UNTESTED as a whole. The engine, Ledger and Postgres were each verified natively (make test / make test-pg); this compose file
+# was written but could not be run in the authoring environment (container registries were blocked/rate-limited there). Treat it as a
+# starting point and expect to fix small things. Ledger v3 licence terms are unresolved - read THIRD_PARTY.md first.
+#
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#   export TREASURY_API_KEYS="$(make -s keys)"
+#   docker compose -f deploy/docker-compose.yml up --build
+name: treasury-stack
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: treasury
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: treasury
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U treasury -d treasury"]
+      interval: 5s
+      retries: 20
+
+  ledger:
+    image: treasury-ledger:local
+    build:
+      context: ${LEDGER_REPO:-https://github.com/formancehq/ledger.git}#${LEDGER_REF:-9a4bb29c8670e6f8c1a166bb85d31d26107f18a2}
+    command: ["run", "--node-id=1", "--cluster-id=local", "--bootstrap", "--bind-addr=0.0.0.0:7777", "--grpc-port=8888",
+              "--http-port=9000", "--wal-dir=/data/wal", "--data-dir=/data/db"]
+    volumes: [ledgerdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9000/health"]
+      interval: 5s
+      retries: 30
+
+  ledger-bootstrap:     # creates the ledger and its REQUIRED reference index (see docs/RUNBOOK.md #21)
+    image: treasury-ledger:local
+    depends_on: { ledger: { condition: service_healthy } }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /app/ledgerctl --insecure --server ledger:8888 ledgers create treasury || true
+        /app/ledgerctl --insecure --server ledger:8888 indexes create --ledger treasury --type reference || true
+        for i in $$(seq 60); do
+          wget -q -O /dev/null 'http://ledger:9000/v3/treasury/transactions?pageSize=1&filter=%7B%22%24match%22%3A%7B%22reference%22%3A%22probe%22%7D%7D' && echo READY && exit 0
+          sleep 2
+        done
+        exit 1
+    restart: "no"
+
+  engine:
+    build: ../treasury
+    depends_on:
+      postgres: { condition: service_healthy }
+      ledger-bootstrap: { condition: service_completed_successfully }
+    environment:
+      TREASURY_ENV: prod
+      TREASURY_ALLOW_MOCK_BANKS: "1"          # SIMULATED banks. Remove once you have real adapters.
+      LEDGER_URL: http://ledger:9000
+      LEDGER_NAME: treasury
+      DATABASE_URL: postgresql://treasury:${POSTGRES_PASSWORD}@postgres:5432/treasury
+      TREASURY_API_KEYS: "${TREASURY_API_KEYS:?set TREASURY_API_KEYS, e.g. export TREASURY_API_KEYS=$(make -s keys)}"
+      RAFIKI_WEBHOOK_SECRET: ${RAFIKI_WEBHOOK_SECRET:-}
+      STRIPE_ISSUING_AUTH_WEBHOOK_SECRET: ${STRIPE_ISSUING_AUTH_WEBHOOK_SECRET:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    ports: ["127.0.0.1:8200:8200"]            # API on localhost only; metrics (9100) stay inside the compose network
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  pgdata:
+  ledgerdata:

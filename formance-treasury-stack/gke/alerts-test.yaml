@@ -1,0 +1,39 @@
+rule_files: [alerts.rules.yaml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - { series: 'treasury_payouts_needing_attention{pod="treasury-engine-a"}', values: '0 1x30' }
+      - { series: 'treasury_payouts{status="routing",pod="treasury-engine-a"}', values: '1x30' }
+      - { series: 'up{namespace="treasury",pod="treasury-engine-a"}', values: '1x30' }
+      - { series: 'up{namespace="treasury",pod="treasury-engine-b"}', values: '0x30' }
+      - { series: 'treasury_http_requests_total{status="500"}', values: '0+10x30' }
+      - { series: 'treasury_http_requests_total{status="200"}', values: '0+90x30' }
+      - { series: 'treasury_http_requests_total{status="401"}', values: '0+120x30' }
+      - { series: 'treasury_http_request_seconds_bucket{route="/stripe/issuing/authorizations",le="0.1"}', values: '0+1x30' }
+      - { series: 'treasury_http_request_seconds_bucket{route="/stripe/issuing/authorizations",le="0.25"}', values: '0+5x30' }
+      - { series: 'treasury_http_request_seconds_bucket{route="/stripe/issuing/authorizations",le="+Inf"}', values: '0+10x30' }
+      - { series: 'treasury_card_decisions_total{approved="false",response_code="51"}', values: '0+8x30' }
+      - { series: 'treasury_card_decisions_total{approved="true",response_code="00"}', values: '0+2x30' }
+    alert_rule_test:
+      - { eval_time: 20m, alertname: TreasuryPayoutOutcomeUnknown, exp_alerts: [{ exp_labels: { severity: critical }, exp_annotations: { summary: "Payout in review: bank outcome unknown. Resolve by lookup before any retry (RUNBOOK)." } }] }
+      - { eval_time: 20m, alertname: TreasuryPayoutsStuck, exp_alerts: [{ exp_labels: { severity: warning }, exp_annotations: { summary: "Payouts not progressing; recovery loop clears within ~1m when healthy." } }] }
+      - { eval_time: 20m, alertname: TreasuryEngineNotReady, exp_alerts: [{ exp_labels: { severity: critical }, exp_annotations: { summary: "Fewer than 2 treasury-engine replicas are being scraped." } }] }
+      - { eval_time: 20m, alertname: TreasuryErrorRate, exp_alerts: [{ exp_labels: { severity: critical }, exp_annotations: { summary: "More than 1% of engine requests return 5xx." } }] }
+      - { eval_time: 20m, alertname: TreasuryCardAuthorizationLatency, exp_alerts: [{ exp_labels: { severity: warning, route: /stripe/issuing/authorizations }, exp_annotations: { summary: "p99 card authorization latency above 100 ms (Stripe allows 2 s)." } }] }
+      - { eval_time: 20m, alertname: TreasuryAuthFailures, exp_alerts: [{ exp_labels: { severity: warning }, exp_annotations: { summary: "Sustained 401/403: misconfigured client or attack." } }] }
+      - { eval_time: 22m, alertname: TreasuryCardDeclineSpike, exp_alerts: [{ exp_labels: { severity: warning }, exp_annotations: { summary: "Over half of card authorizations declined." } }] }
+      - { eval_time: 3m, alertname: TreasuryPayoutOutcomeUnknown, exp_alerts: [] }
+  - interval: 1m
+    input_series:
+      - { series: 'treasury_payouts_needing_attention{pod="treasury-engine-a"}', values: '0x30' }
+      - { series: 'up{namespace="treasury",pod="treasury-engine-a"}', values: '1x30' }
+      - { series: 'up{namespace="treasury",pod="treasury-engine-b"}', values: '1x30' }
+      - { series: 'treasury_http_requests_total{status="200"}', values: '0+100x30' }
+      - { series: 'treasury_card_decisions_total{approved="true",response_code="00"}', values: '0+9x30' }
+      - { series: 'treasury_card_decisions_total{approved="false",response_code="51"}', values: '0+1x30' }
+    alert_rule_test:
+      - { eval_time: 22m, alertname: TreasuryPayoutOutcomeUnknown, exp_alerts: [] }
+      - { eval_time: 22m, alertname: TreasuryEngineNotReady, exp_alerts: [] }
+      - { eval_time: 22m, alertname: TreasuryErrorRate, exp_alerts: [] }
+      - { eval_time: 22m, alertname: TreasuryCardDeclineSpike, exp_alerts: [] }

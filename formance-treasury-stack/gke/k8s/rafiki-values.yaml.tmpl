@@ -1,0 +1,23 @@
+# Rendered by gke-deploy.sh. Used for the rafiki-backend / rafiki-auth / rafiki-frontend subcharts.
+# DB and Redis are managed services (Cloud SQL / Memorystore); passwords come from the 'rafiki-secrets' Secret via --set-file.
+rafiki-backend:
+  nodeEnv: production
+  logLevel: info
+  serviceUrls:
+    OPEN_PAYMENTS_URL: ${RAFIKI_PUBLIC_URL}
+    WALLET_ADDRESS_URL: ${RAFIKI_PUBLIC_URL}/.well-known/pay
+    WEBHOOK_URL: http://treasury-engine.${NAMESPACE}:8200/rafiki/webhooks
+    EXCHANGE_RATES_URL: ${EXCHANGE_RATES_URL}
+    AUTH_SERVER_GRANT_URL: ${RAFIKI_AUTH_PUBLIC_URL}
+    AUTH_SERVER_INTROSPECTION_URL: http://rafiki-rafiki-auth:3007
+  redis: { host: "${REDIS_HOST}", port: ${REDIS_PORT} }
+  postgresql: { host: "${SQL_IP}", port: 5432, username: rafiki_backend, database: rafiki_backend }
+  ilp: { address: ${ILP_ADDRESS} }
+rafiki-auth:
+  redis: { host: "${REDIS_HOST}", port: ${REDIS_PORT} }
+  postgresql: { host: "${SQL_IP}", port: 5432, username: rafiki_auth, database: rafiki_auth }
+  identityServer: { domain: "${IDP_URL}" }
+rafiki-frontend:
+  serviceUrls:
+    GRAPHQL_URL: http://rafiki-rafiki-backend:3001/graphql
+    OPEN_PAYMENTS_URL: ${RAFIKI_PUBLIC_URL}/

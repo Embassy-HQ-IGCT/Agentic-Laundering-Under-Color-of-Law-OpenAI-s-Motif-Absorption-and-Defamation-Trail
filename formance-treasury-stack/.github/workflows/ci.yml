@@ -1,0 +1,50 @@
+# Active when this directory is the root of its own repository. Free for public repositories.
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  lint-and-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: opentofu/setup-opentofu@v1
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck gettext-base
+      - run: pip install pyflakes==3.2.0 pyyaml
+      - run: make lint
+      - name: Render deploy kit + audit Kubernetes hardening + validate OpenTofu config
+        run: |
+          mkdir -p .build
+          # gke-deploy.sh only needs gcloud/kubectl/helm for --plan/--apply; render-only needs none of them
+          TF=$(command -v tofu) gke/gke-deploy.sh --render-only --non-interactive --config gke/ci-answers.env --out .build/render
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, postgres]
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: treasury, POSTGRES_PASSWORD: ci, POSTGRES_DB: treasury }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U treasury" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "stable" }       # the pinned Ledger revision needs a recent Go (>= 1.27 when this was written)
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r treasury/requirements.txt
+      - run: make ledger
+      - name: Test (${{ matrix.db }})
+        run: |
+          if [ "${{ matrix.db }}" = postgres ]; then export PG_URL=postgresql://treasury:ci@localhost:5432/treasury; fi
+          make test${{ matrix.db == 'postgres' && '-pg' || '' }}
